@@ -1,0 +1,17 @@
+{
+  "name": "llms-bridge",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "跨厂商 harness 协同桥:把子任务派发给本机其它厂商的 agent harness 并收回结构化结果",
+  "engines": {
+    "node": ">=23.6"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test",
+    "test:live": "node --test --test-name-pattern=真实派发",
+    "detect": "node src/cli.ts detect",
+    "dispatch": "node src/cli.ts dispatch"
+  }
+}

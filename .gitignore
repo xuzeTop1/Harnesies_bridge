@@ -1,0 +1,12 @@
+# worker 产物与临时探测目录,不进版本库(见 AGENTS.md 提交纪律)
+.scratch/
+*.log
+
+# 每个 worker 的 worktree(隔离用),由桥自动创建与回收
+.llms-bridge/
+
+# Node
+node_modules/
+
+# 审记记录:本地保留,但不该跟随源码分发
+audit/

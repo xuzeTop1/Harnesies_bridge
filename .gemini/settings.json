@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "llms-bridge": {
+      "command": "node",
+      "args": [
+        "D:\\LLMS_Bridge\\src\\mcp-server.ts"
+      ],
+      "description": "跨厂商 harness 协同桥"
+    }
+  }
+}

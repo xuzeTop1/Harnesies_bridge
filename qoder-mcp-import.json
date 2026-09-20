@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "llms-bridge": {
+      "command": "D:\\node.js\\node.exe",
+      "args": ["D:\\LLMS_Bridge\\src\\mcp-server.ts"]
+    }
+  }
+}
