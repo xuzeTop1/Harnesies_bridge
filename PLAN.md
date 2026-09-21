@@ -468,7 +468,7 @@ codex exec -c 'mcp_servers.llms-bridge.command="node"' \
 | **Claude Code** | ✅ 项目级 `.mcp.json`(它读这个) | **未测,不是"待批准"** —— 早先那条 `⏸ Pending approval` 是在**别的 cwd** 观察到的,不能拿来当本项目的结论。实测(2026-09-19 13:38)`~/.claude.json` 的 32 个项目条目里**没有 `D:\LLMS_Bridge`**,即 Claude Code **从未在这个目录启动过**,所以桥有没有被认出、要不要批准,**两说**。往项目 `.claude/settings.json` 加 `enabledMcpjsonServers` 已实测**无效**(信任状态记在 `~/.claude.json` 的按项目条目里)。要做的事只有一件:在项目目录**交互式跑一次 `claude`**。另:其 `ANTHROPIC_BASE_URL = https://api.deepseek.com/anthropic` |
 | **Gemini** | ✅ 项目级 `.gemini/settings.json`(`gemini mcp add --scope project`) | **已注册但被禁用** —— `disabled because this folder is untrusted`。解法见 §3.5 |
 | **Qoder CN** | ✅ 项目级 `.qoder/.mcp.json` + 项目 `.mcp.json` | **配置已就位**(app.asar 确认它读这两个路径:`sourcePath: Ae(A,".qoder",".mcp.json")`),**GUI 内确认未做** |
-| **WorkBuddy** | ✅ **`~/.workbuddy/mcp.json`** —— 它**没有表单式对话框**:`customMcpConfigPath = join(configDir,"mcp.json")`,而 `openMcpConfig()` 就是 `openPath(该文件)`,所以**手工编辑正是它设计上的正门** | **已写入,待批准(2026-09-20)**:合并进 `llms-bridge`(只写 `command`/`args`,**不写 `type`** —— 它的解析器 `if (!cfg.type) cfg.type = cfg.command ? "stdio" : cfg.url ? "http"` 会自己推断)。回读校验通过、原有 `lighthouse-ops` 一字未改、备份在 `mcp.json.bak-llmsbridge`。写入时 WorkBuddy **未运行**,故下次启动应全新读取。**还差用户在它界面批准一次**(`mcp-approvals.json` 里尚无 `::llms-bridge`;哈希算的是**该 server 自己的配置对象**,故改它的 command/args 会要求重批) |
+| **WorkBuddy** | ❌ **手改 `~/.workbuddy/mcp.json` 不生效**(此前我记的"正门"是错的) | **实测否证(2026-09-21)**:按 `command`/`args` 加入 `llms-bridge` 后启动 WorkBuddy —— 它**不回写该文件**(mtime 仍是我写入的时间)、**不生成审批条目**(`mcp-approvals.json` 只有 `mcd-mcp`/`lighthouse-ops`)、**UI 无任何提示**。**已还原**,与备份逐字节一致。要走它自己的连接器 UI。 |
 
 结论:**各厂商的 MCP 发现行为不一致,不能靠一份 `.mcp.json` 通吃。**
 每个宿主都要单独实测并记录,这正是 `AGENTS.md` 要求"断言前穷举验证"的原因。
@@ -686,32 +686,40 @@ db 是 **protobuf 字节数组**(`steps`/`gen_metadata`),扫可读 ASCII 只找�
      注意别把"两家一致"当结论:谁对要读原文,不是数票。
 5. **Antigravity 若要成为 worker,前置是隔离而不是鉴权**:需用户在 `Settings → Projects → Add Folder`
    建一个专用空目录,并先查清"agent 不执行"那个真问题。**不得导出其 token/cookie(铁律 1 无例外)。**
-6. ~~**WorkBuddy / Qoder 是否接受 stdio 形态的 MCP server —— 这是 M2 真正的未知项**~~ →
-   **两家都接受 stdio,因此桥不需要新增 HTTP(streamable)传输层。** 这条结论省下的是一个不小的功能,
-   所以在动手前用 bundle 里的真实代码钉死(2026-09-19 13:35):
+6. **stdio 形态是否被 GUI 宿主接受 —— Qoder 已证实接受;WorkBuddy 仍未证实(我此前推错了一次)。**
+
+   **更正记录**:本节 2026-09-19 版曾写"两家都接受 stdio,桥不需要 HTTP 传输层"。
+   **WorkBuddy 那半句是错的**,来源是我读到了 `loadPluginMcpServers` 里的
+   `if (!cfg.type) cfg.type = typeof cfg.command === "string" ? "stdio" : …`
+   —— 那是**插件配置**的归一化路径,**不是** `~/.workbuddy/mcp.json` 的用户加载路径。
+   我把插件侧行为推广到了用户侧。2026-09-21 实测否证:手改 mcp.json 加 stdio 条目后,
+   WorkBuddy 启动时**不回写、不建审批、UI 无提示**(详见上方宿主矩阵行)。**条目已还原。**
+   所以 WorkBuddy 的连接器有它自己的注册流程(`CUSTOM_MCP_PREFIX` / `readCustomMcpConfigForConnect`,
+   写入走 `writeCustomMcpConfig()`),**手填文件不是入口**。
+   它到底能不能挂 stdio server,**仍未验证** —— 只能走它的 UI 试;若它的 UI 只收 URL,
+   那"桥需要一个 HTTP(streamable)传输层"这个结论就要**重新启用**,不能拿现在这半条证据当已解决。
 
    - **Qoder**:`transportKind === "stdio"` + `readStdioServerParams()`,要求 `params.command` 是 string;
      stdio 走 `kind:"legacy"`。它会在正式 `initialize` 前用**短命兄弟进程**发探测请求
      ("stdio era negotiation on a DISPOSABLE SIBLING"),桥已实测能应答且不退出(见 §5.4 的兼容用例)。
-   - **WorkBuddy**:`app.asar` 里有
-     `if (!cfg.type) { cfg.type = typeof cfg.command === "string" && cfg.command ? "stdio" : (typeof cfg.url === "string" && cfg.url ? "http" : ...) }`
-     —— **`type` 甚至可以省略,有 `command` 就推断成 stdio**;该分支还会把 `cfg.env` 与
-     `buildPluginSubprocessEnvironment()` 合并。bundle 内另含官方 SDK 的 `StdioClientTransport`
-     (server 参数 `{command, args, env, cwd}`),故 `args` 按标准形状生效。
-     它另有 `writeCustomMcpConfig()` / `ensureCustomMcpConfig()`(不存在时写 `{mcpServers:{}}`),
-     即 GUI 的"添加自定义 MCP"落盘路径由这两个方法管理。
-   - 附带:WorkBuddy 的审批面 `~/.workbuddy/mcp-approvals.json` 键形如 `<哈希>::<server 名>` → 毫秒时间戳。
-     **哈希算的是"该 server 自己的配置对象"**(`calculateConfigHash(nextConfig)`),不是整个文件 ——
-     所以改别的 server 不会让它重批,但**改这个 server 的 command/args 会让它的哈希变、要求重批**。
-     它的注册入口也**不是对话框**:`customMcpConfigPath = join(configDir,"mcp.json")`,
-     而 `openMcpConfig()` 就是 `openPath(该文件)` —— **手工编辑 mcp.json 是它设计上的正门**。
-     **2026-09-20 已按用户授权写入 `llms-bridge`**(备份 `mcp.json.bak-llmsbridge`;回读校验通过、
-     `lighthouse-ops` 原样未动、不写 `type` 让其推断为 stdio)。当时 WorkBuddy **未运行**,故下次启动应全新读取。
-     **仍待用户在 WorkBuddy 界面批准一次**(审批表里还没有 `::llms-bridge` 条目)。
+   - **WorkBuddy —— 以下三条是读到的事实,但都**不能**推出"手改 mcp.json 就能挂上":**
+     1. `loadPluginMcpServers` 里确有 `if (!cfg.type) cfg.type = cfg.command ? "stdio" : cfg.url ? "http"`。
+        **注意函数名 —— 这是插件配置的归一化路径,不是用户 `mcp.json` 的加载路径。**
+     2. 审批面 `~/.workbuddy/mcp-approvals.json` 键形如 `<哈希>::<server 名>` → 毫秒时间戳;
+        哈希算的是**该 server 自己的配置对象**(`calculateConfigHash(nextConfig)`),不是整个文件,
+        所以改别的 server 不会让它重批,改这个 server 的 command/args 才会。
+     3. `customMcpConfigPath = join(configDir,"mcp.json")`,而 `openMcpConfig()` 就是
+        `openPath(该文件)` —— 它**确实**给你打开这个文件看/改,但连接器实体另有注册流程
+        (`CUSTOM_MCP_PREFIX` / `readCustomMcpConfigForConnect`,写入走 `writeCustomMcpConfig()`)。
 
-   仍未验证的只是**操作层面**:往 WorkBuddy 里实际挂一次、看它能否列出 5 个原语。
-   配置形状已无需猜测:与 Qoder 那份完全相同(`command` 用 `D:\node.js\node.exe` 绝对路径,
-   `args` 指 `D:\LLMS_Bridge\src\mcp-server.ts`,不需要 `env`)。
+     **实测否证(2026-09-21)**:按 ③ 推断"手改是正门",于是往 `mcp.json` 合并了
+     `llms-bridge`(`command`+`args`,不写 `type`)。WorkBuddy 启动后:**不回写该文件**(mtime 未变)、
+     **不生成审批条目**、**UI 无任何提示**。条目**已还原**,与备份逐字节一致。
+     所以第 3 条那句"openPath 就是让你改"我读得太浅 —— 它打开的是**查看/由程序维护**的文件。
+
+   **结论修正**:此前本节写"两家都接受 stdio,桥不需要 HTTP 传输层" —— **WorkBuddy 那半句作废**。
+   它能否挂 stdio server **仍未验证**,只能走它自己的连接器 UI;若那 UI 只收 URL,
+   "桥需要 HTTP(streamable)传输层"这个结论要**重新启用**,不能拿现在这半条证据当已解决。
 
 ### 8.2b 已结掉(2026-09-19,不要再当未知项)
 
