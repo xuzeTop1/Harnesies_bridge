@@ -273,3 +273,52 @@ test('codebuddy 的 argv 构造符合实测的旗标', () => {
   // prompt 必须是最后一个位置参数,否则会被当成旗标值
   assert.equal(ro.args[ro.args.length - 1], 'x');
 });
+
+// —— 模型清单(harness_models 的数据源)——
+//
+// 这里真正要守的不是"能不能列出模型",而是**列不出来时不许编**。
+// 面板/自动选模型一旦拿默认值填空,用户就会派发出一个根本不存在的模型。
+
+test('models():自报的给清单;不自报的必须 declared:false + 空清单 + 说明', async () => {
+  const base = {
+    tier: 2,
+    supportedApprovals: ['read-only'],
+    plan: () => ({ command: 'x', args: [] }),
+    createRun: () => ({ parseLine: () => [], finalize: () => ({}) }),
+    detect: async () => ({ available: true, version: 'test' }),
+  };
+  const scheduler = new Scheduler([
+    {
+      ...base,
+      id: 'declarer',
+      displayName: '会自报的',
+      listModels: async () => ({ models: ['auto', 'm-1'], source: 'declarer --help', checkedAt: 123 }),
+    },
+    { ...base, id: 'silent', displayName: '不自报的' },
+  ]);
+
+  const out = await scheduler.models();
+  const d = out.find((x) => x.id === 'declarer');
+  assert.equal(d.declared, true);
+  assert.deepEqual(d.models, ['auto', 'm-1']);
+  assert.equal(d.source, 'declarer --help', '必须带出处,否则无法判断清单何时有效');
+  assert.equal(d.checkedAt, 123);
+
+  const q = out.find((x) => x.id === 'silent');
+  assert.equal(q.declared, false);
+  assert.deepEqual(q.models, [], '不自报就必须是空清单,不能塞默认模型顶上去');
+  assert.match(q.source, /未知|不要填/, '未声明时要给出可读的原因,而不是留空让人误解为"没有模型"');
+});
+
+test('codebuddy 确实能自报清单(锚点断言,避免随版本漂移而误红)', async () => {
+  const cb = adapters.find((a) => a.id === 'codebuddy');
+  const catalog = await cb.listModels();
+  assert.ok(catalog, 'codebuddy 的 --help 里有 "Currently supported: (...)",应能解析出来');
+  assert.ok(catalog.models.includes('auto'), 'auto 是它列表里的第一项,用户要的"AUTO 默认"是原生取值');
+  assert.ok(
+    catalog.models.some((m) => /deepseek/i.test(m)),
+    `应包含 deepseek 档,实际:${catalog.models.join(', ')}`,
+  );
+  assert.match(catalog.source, /--help/, '出处要能回答"这是哪条命令说的"');
+  assert.ok(catalog.checkedAt > 0, '清单会漂移,必须带核查时间');
+});

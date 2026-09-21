@@ -76,7 +76,7 @@ test('MCP 握手:回显客户端协议版本,声明 tools 能力', async () => {
   }
 });
 
-test('tools/list 提供五个原语', async () => {
+test('tools/list 提供六个原语', async () => {
   const s = startServer();
   try {
     await s.send('initialize', { protocolVersion: '1', capabilities: {} });
@@ -86,6 +86,7 @@ test('tools/list 提供五个原语', async () => {
       'harness_dispatch',
       'harness_events',
       'harness_list',
+      'harness_models',
       'harness_poll',
       'harness_result',
     ]);
@@ -258,7 +259,7 @@ test('poll / result / events 遇到未知 task_id 必须报错但不崩连接', 
 
     // 关键:三次错误之后连接仍然可用
     const tools = await s.send('tools/list', {});
-    assert.equal(tools.result.tools.length, 5, '报错不得让 server 掉线');
+    assert.equal(tools.result.tools.length, 6, '报错不得让 server 掉线');
   } finally {
     s.close();
   }
@@ -277,7 +278,7 @@ test('Qoder 式探测:未 initialize 就请求 tools/list 必须存活且有应�
   try {
     const res = await s.send('tools/list', {});
     assert.ok(Array.isArray(res.result?.tools), '应直接返回 tools 数组');
-    assert.equal(res.result.tools.length, 5, `应有 5 个原语,实际 ${res.result.tools.length}`);
+    assert.equal(res.result.tools.length, 6, `应有 6 个原语,实际 ${res.result.tools.length}`);
     assert.equal(s.child.killed, false, '探测后进程必须还活着');
   } finally {
     s.close();
@@ -299,7 +300,7 @@ test('Qoder 式探测:一行非 JSON 必须回 -32700 而不是崩掉进程', as
 
     // 关键:被探测过一次垃圾之后,正常请求仍须服务
     const res = await s.send('tools/list', {});
-    assert.equal(res.result.tools.length, 5, '收到垃圾行后仍应正常应答');
+    assert.equal(res.result.tools.length, 6, '收到垃圾行后仍应正常应答');
   } finally {
     s.close();
   }

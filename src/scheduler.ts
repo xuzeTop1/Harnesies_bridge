@@ -4,6 +4,8 @@ import type {
   Adapter,
   ApprovalLevel,
   BridgeEvent,
+  HarnessModels,
+  ModelCatalog,
   TaskResult,
   TaskSpec,
   TaskStatus,
@@ -380,6 +382,40 @@ export class Scheduler {
     const state = this.#tasks.get(taskId);
     if (!state) throw new DispatchRejected(`未知 taskId: ${taskId}`);
     return state.events;
+  }
+
+  #modelCache = new Map<string, ModelCatalog | null>();
+
+  /**
+   * 各 harness **自己声明**的模型清单。
+   *
+   * 不自报的一律 `declared:false` 且 `models:[]` —— 调用方必须渲染成"未知"。
+   * 这条限制是刻意的:面板一旦允许用"看起来合理"的默认值填空,就会派出一个根本不存在的模型,
+   * 而用户看到的是一次失败的任务而不是一个空下拉框。
+   * 结果按进程缓存:取清单要跑 `--help` 子进程,每次刷新都跑会明显拖慢面板。
+   */
+  async models(force = false): Promise<HarnessModels[]> {
+    const report = await this.detectAll(force);
+    return Promise.all(
+      [...this.#adapters.values()].map(async (a) => {
+        if (force || !this.#modelCache.has(a.id)) {
+          const catalog = a.listModels ? await a.listModels().catch(() => null) : null;
+          this.#modelCache.set(a.id, catalog);
+        }
+        const catalog = this.#modelCache.get(a.id) ?? null;
+        return {
+          id: a.id,
+          displayName: a.displayName,
+          available: report.find((r) => r.id === a.id)?.available === true,
+          declared: catalog !== null,
+          models: catalog?.models ?? [],
+          source:
+            catalog?.source ??
+            `${a.id} 不自己声明模型清单(未实现 listModels,或其输出解析失败)—— 请按"未知"处理,不要填默认值`,
+          ...(catalog ? { checkedAt: catalog.checkedAt } : {}),
+        };
+      }),
+    );
   }
 
   /** 等任务跑完并取结果。 */

@@ -156,6 +156,39 @@ export interface Adapter {
   detect(): Promise<DetectResult>;
   plan(spec: TaskSpec): SpawnPlan;
   createRun(spec: TaskSpec, taskId: string): RunParser;
+  /**
+   * 该 harness 能否**自己声明**它支持哪些模型。
+   *
+   * 返回 null 的意思是"它不自报",**不是**"它没有模型" —— 调用方必须把它渲染成"未知",
+   * 绝不能填一份看起来合理的清单。AGENTS.md 禁止编造能力清单,而模型菜单正是最容易被编的地方:
+   * 面板一旦有了假条目,用户就会照着它去派发,然后拿到一个不存在的模型。
+   */
+  listModels?(): Promise<ModelCatalog | null>;
+}
+
+/** 来自 harness 自身输出的模型清单。`source` 必须能回答"这是哪条命令在什么时候说的"。 */
+export interface ModelCatalog {
+  models: string[];
+  /** 取到清单的依据,例如 `codebuddy --help` 的 `--model` 行。 */
+  source: string;
+  /** 本次解析的时间戳;清单会随版本漂移,所以必须带日期(AGENTS.md 证据纪律)。 */
+  checkedAt: number;
+}
+
+/** `harness_models` 的返回单元。 */
+export interface HarnessModels {
+  id: string;
+  displayName: string;
+  available: boolean;
+  /**
+   * false = 这个 harness **不自己声明**模型清单(或解析失败)。
+   * 此时 `models` 是空数组,调用方**必须显示"未知"**,不许拿"默认模型"或别家的清单顶上。
+   */
+  declared: boolean;
+  models: string[];
+  /** 清单出处,例如 `codebuddy --help 的 --model 行`。未声明时给出为什么未知。 */
+  source?: string;
+  checkedAt?: number;
 }
 
 /** 派发前就失败的路径(参数缺失、审批未放行、harness 不可用)统一抛这个。 */

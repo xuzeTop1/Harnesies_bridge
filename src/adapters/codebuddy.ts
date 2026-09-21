@@ -7,6 +7,7 @@ import type {
   ApprovalLevel,
   BridgeEvent,
   DetectResult,
+  ModelCatalog,
   EventType,
   RunParser,
   SpawnPlan,
@@ -183,6 +184,34 @@ export function createCodeBuddyAdapter(): Adapter {
         return { available: true, version: stdout.trim() + ' | ' + entry.label };
       } catch (err) {
         return { available: false, detail: '--version 失败: ' + (err as Error).message };
+      }
+    },
+
+    /**
+     * codebuddy 的 `--help` 会把支持的模型**全部列出来**(`Currently supported: (auto, …)`),
+     * 所以这份清单是它自己声明的,不是我们整理的。解析不到就返回 null —— 宁可"未知"也不编。
+     * 清单会随版本漂移,故每次现取并带 `checkedAt`。
+     */
+    async listModels(): Promise<ModelCatalog | null> {
+      if (!entry) return null; // 未探测;调度器保证先跑过 detectAll()
+      try {
+        const { stdout } = await execFileAsync(entry.command, [...entry.prefixArgs, '--help'], {
+          timeout: 60_000,
+          windowsHide: true,
+          maxBuffer: 8 * 1024 * 1024,
+        });
+        // --help 会按终端宽度折行,先压平再匹配,否则列表被切断就会漏读。
+        const flat = stdout.replace(/\s+/g, ' ');
+        const m = /Currently supported:\s*\(([^)]+)\)/.exec(flat);
+        if (!m) return null;
+        const models = m[1]
+          .split(',')
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
+        if (models.length === 0) return null;
+        return { models, source: 'codebuddy --help 的 --model 行', checkedAt: Date.now() };
+      } catch {
+        return null;
       }
     },
 

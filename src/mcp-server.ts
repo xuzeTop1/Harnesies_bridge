@@ -48,6 +48,19 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
+    name: 'harness_models',
+    description:
+      '列出各家 harness **自己声明**支持的模型,带出处与核查时间。没自报的会返回 declared:false + 空列表 —— ' +
+      '那必须当成"未知"渲染,不许填默认值(填了就等于派一个不存在的模型)。选定后用 harness_dispatch 的 model 参数。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        force: { type: 'boolean', description: '忽略缓存,重新向各家取一次清单' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'harness_dispatch',
     description:
       '把子任务派发给指定 harness,**立刻返回 task_id**(不阻塞)。之后用 harness_poll 轮询、harness_result 取结果。',
@@ -150,6 +163,9 @@ async function callTool(name: string, args: Record<string, unknown>) {
         })),
       );
     }
+
+    case 'harness_models':
+      return textResult(await scheduler.models(args.force === true));
 
     case 'harness_dispatch': {
       const session: SessionMode = args.resume_session_id
