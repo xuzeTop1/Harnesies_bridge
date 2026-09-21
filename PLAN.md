@@ -788,7 +788,13 @@ db 是 **protobuf 字节数组**(`steps`/`gen_metadata`),扫可读 ASCII 只找�
 1. **按能力标签自动选人**。`TaskSpec` **没有** `capabilities` 字段,调度器也不做能力匹配 ——
    `harness` 必须显式指定。原因:能力标签需要各 harness 的**可信**能力元数据,而我没有可验证的
    来源(凭空写"qwen 支持 1M 上下文"这类是编数字,AGENTS.md 禁止)。要做得先有实测依据。
-   目前唯一可用的多样性手段是显式指定 `model`(见 §5.1)。
+   目前唯一可用的多样性手段是显式指定 `model`(见 §5.1),而**清单从哪来**已由
+   `harness_models` 解决(2026-09-21):`Adapter.listModels?()` 只接受**各家自己声明**的清单,
+   实测六家里只有 `codebuddy` 的 `--help` 会打印 `Currently supported: (…)`(19 项,含 `auto`),
+   其余五家返回 `declared:false` + 空列表 + 原因。
+   **契约**:面板/大脑**不得**为 `declared:false` 的 harness 填默认模型或借用别家名字 ——
+   宁可显示"未知"。用户点名要一家未自报的模型时应拒绝并说明,而不是猜一个相近的。
+   用例见 `test/adapters.test.mjs` 的 `models()` 两条(假适配器零额度 + codebuddy 锚点断言)。
 2. **层级① 的三个 spec 选项未接**:`model`、`session`(resume/fork)、`output_schema`。
    ACP 侧都没实现,传了会被忽略 —— 但**不会静默丢弃**:连接成功后会各回一条 `error` 事件说明
    (见 `acp.ts` 的 `unsupportedOptionEvents()`)。需要模型级差异请用层级②③。
