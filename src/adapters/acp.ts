@@ -473,9 +473,18 @@ export function createAcpAdapter(config: AcpAdapterConfig): Adapter {
       if (!cli) {
         return { available: false, detail: `找不到 ${config.binName}(${config.pkgName})的 bin` };
       }
-      const probe = await acpProbe(cli, acpArgs, 8_000);
+      // 单次 8s 超时就判"不可用"是错的:冷启动时 7 个探测并发,qwen/mimo 这类大 Node CLI 的
+      // initialize 常常要更久。实测 Qoder 启动瞬间三家 ACP 全报"握手无响应",而另起进程三家正常
+      // —— 那意味着 `harness_list` 的答案取决于"你什么时候问",而它是大脑唯一的依据。
+      // 所以超时只算"未判定":再给一次更宽的机会,两次都失败才降级,且措辞必须说清这是未判定。
+      let probe = await acpProbe(cli, acpArgs, 8_000);
+      if (!probe) probe = await acpProbe(cli, acpArgs, 25_000);
       if (!probe) {
-        return { available: false, detail: 'ACP 握手无响应(initialize 未返回)' };
+        return {
+          available: false,
+          detail:
+            'ACP 两次探测均无响应(8s + 25s)—— 这是**未判定**,不是"已确认不可用";重跑 harness_list 可再试',
+        };
       }
       const version = probe.agentVersion
         ? `${probe.agentName ?? config.id} ${probe.agentVersion} (ACP v${probe.protocolVersion})`
