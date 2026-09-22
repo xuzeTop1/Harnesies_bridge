@@ -4,6 +4,7 @@ import type {
   Adapter,
   ApprovalLevel,
   BridgeEvent,
+  EgressReport,
   HarnessModels,
   ModelCatalog,
   TaskResult,
@@ -39,6 +40,12 @@ export interface DispatchAck {
   /** 是否分配了独立 worktree。 */
   isolated: boolean;
   worktreePath?: string;
+  /**
+   * 这次派发的数据去向(adapter 自报;它不知道就留空,调度器绝不替它编)。
+   * 放在 ack 而不是只放 harness_list,是因为用户会在两次派发之间用 cc-switch 换端点 ——
+   * 缓存过的探测结果可能已经过期,而 ack 一定是**这次**算出来的。
+   */
+  egress?: EgressReport;
 }
 
 export interface HarnessInfo {
@@ -52,6 +59,7 @@ export type HarnessReport = HarnessInfo & {
   available: boolean;
   version?: string;
   detail?: string;
+  egress?: EgressReport;
 };
 
 export interface TaskSnapshot {
@@ -114,6 +122,8 @@ export class Scheduler {
           available: d.available,
           version: d.version,
           detail: d.detail,
+          // 出口自报失败 ≠ 该 harness 不可用:降级成"桥不知道",不许把探测整体拖挂。
+          egress: a.egress ? await a.egress().catch(() => undefined) : undefined,
         };
       }),
     );
@@ -215,7 +225,19 @@ export class Scheduler {
     };
     this.#tasks.set(spec.taskId, state);
     this.#running.set(spec.taskId, this.#execute(adapter, runSpec, state, plan));
-    return { taskId: spec.taskId, isolated, worktreePath };
+
+    // 端点可以在两次派发之间被用户整体换掉(cc-switch),所以 ack 里的出口**现取**,
+    // 不复用 detectAll 的缓存。取不到就不报,宁缺毋滥。
+    const egress = adapter.egress
+      ? await adapter.egress().catch(() => undefined)
+      : undefined;
+
+    return {
+      taskId: spec.taskId,
+      isolated,
+      worktreePath,
+      egress: egress ? { ...egress, promptBytes: Buffer.byteLength(spec.prompt, 'utf8') } : undefined,
+    };
   }
 
   async #execute(

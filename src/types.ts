@@ -124,6 +124,22 @@ export interface DetectResult {
   detail?: string;
 }
 
+/**
+ * 一次派发会把数据发往哪个主机 —— 见 src/egress.ts 的动机说明。
+ * 只允许出现主机名与代理线索;任何凭证值(连长度都不许)不得进这个结构。
+ */
+export interface EgressReport {
+  endpointHost: string;
+  nativeAnthropic: boolean;
+  /** 端点是从哪读到的,便于用户核对"我到底切了哪一层"。 */
+  source: string;
+  proxyClues: string[];
+  /** 给人看的一句风险提示,不猜、不替用户决定。 */
+  notice: string;
+  /** 调度器在派发时填:这次实际外发的提示词体积。 */
+  promptBytes?: number;
+}
+
 export interface SpawnPlan {
   command: string;
   args: string[];
@@ -164,6 +180,12 @@ export interface Adapter {
    * 面板一旦有了假条目,用户就会照着它去派发,然后拿到一个不存在的模型。
    */
   listModels?(): Promise<ModelCatalog | null>;
+  /**
+   * 自报"这次派发的数据会发往哪个主机"。不实现 = 桥不知道,调用方**不许**替它编一个。
+   * 用途见 src/egress.ts:同一个 harness id 可能对应原生端点或第三方中转,两者数据去向
+   * 和账号风险面完全不同,而用户用 cc-switch 一键就能切换 —— 所以每次派发都要说清。
+   */
+  egress?(): Promise<EgressReport>;
 }
 
 /** 来自 harness 自身输出的模型清单。`source` 必须能回答"这是哪条命令在什么时候说的"。 */

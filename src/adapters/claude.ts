@@ -5,6 +5,7 @@ import type {
   ApprovalLevel,
   BridgeEvent,
   DetectResult,
+  EgressReport,
   EventType,
   RunParser,
   SpawnPlan,
@@ -14,6 +15,7 @@ import type {
 import { DispatchRejected } from '../types.ts';
 import { resolveGlobalCli } from '../locate.ts';
 import type { ResolvedCli } from '../locate.ts';
+import { claudeEgress } from '../egress.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -146,6 +148,11 @@ export function createClaudeAdapter(): Adapter {
       } catch (err) {
         return { available: false, detail: `--version 失败: ${(err as Error).message}` };
       }
+    },
+
+    /** 数据去向自报:用户用 cc-switch 一键就能在原生 Anthropic 和国内中转之间切换。 */
+    async egress(): Promise<EgressReport> {
+      return claudeEgress();
     },
 
     plan(spec: TaskSpec): SpawnPlan {

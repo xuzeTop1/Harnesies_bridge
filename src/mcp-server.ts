@@ -200,6 +200,18 @@ async function callTool(name: string, args: Record<string, unknown>) {
         model: spec.model,
         isolated: ack.isolated,
         worktree: ack.worktreePath,
+        // 每次派发现场重算:让用户在派发后就看见"这批数据到底发去了哪",
+        // 而不是去翻可能已过期的 harness_list。该 harness 不自报时整个字段缺失。
+        egress: ack.egress
+          ? {
+              endpoint_host: ack.egress.endpointHost,
+              native_anthropic: ack.egress.nativeAnthropic,
+              source: ack.egress.source,
+              prompt_bytes: ack.egress.promptBytes,
+              proxy_clues: ack.egress.proxyClues,
+              notice: ack.egress.notice,
+            }
+          : undefined,
         hint: '用 harness_poll 轮询,harness_result 取结果',
       });
     }
