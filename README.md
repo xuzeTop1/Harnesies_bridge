@@ -49,6 +49,43 @@ npm run dispatch      # 命令行派发一次(调试用;正常入口是 MCP)
 上层必须渲染成"未知",不许填一个看起来合理的默认型号 —— 面板有了假条目,用户就会照着派发,
 然后拿到一个不存在的模型。
 
+## 一次派发长什么样
+
+主脑(你当前的会话)调用:
+
+```jsonc
+// tools/call → harness_dispatch
+{
+  "harness": "codex",
+  "prompt": "评审 cwd 下 `changes.patch` 里的改动,只回答 LGTM / 不 LGTM 加理由",
+  "cwd": "D:/some/git/repo",
+  "approval": "read-only",     // 必填,无默认
+  "max_wall_ms": 480000,       // 必填,到点杀进程树
+  "max_tokens": 200000         // 可选
+}
+```
+
+返回**立刻**给,不等 worker:
+
+```jsonc
+{
+  "task_id": "1007571f-7062-4d6d-b768-01dc55eb416f",
+  "harness": "codex",
+  "isolated": true,
+  "worktree": "…/.llms-bridge/worktrees/1007571f70624d6d",
+  "egress": {
+    "endpoint_host": "api.anthropic.com",
+    "native_anthropic": true,
+    "source": "未配置端点 → 该 CLI 默认值",
+    "prompt_bytes": 163,
+    "notice": "原生端点:数据将离开本机前往官方服务…"
+  }
+}
+```
+
+之后 `harness_poll` 看是否结束 → `harness_result` 取文本/用量/diff → `harness_events` 看过程。
+写任务要把 `approval` 提到 `workspace-write`,桥会自动给它分配独立 worktree,源工作区不动。
+
 ## 三层集成,一套事件模型
 
 层级① ACP(ndjson JSON-RPC over stdio,可多轮)、② Claude 兼容 stream-json(双向流)、

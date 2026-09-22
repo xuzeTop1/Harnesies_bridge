@@ -26,11 +26,11 @@ async function fixtureSettings(env) {
 
 test('settings.json 里的第三方端点:报主机、判为非原生、且不吐凭证', async () => {
   const { dir, file } = await fixtureSettings({
-    ANTHROPIC_BASE_URL: 'https://llm-abc123.cn-beijing.maas.aliyuncs.com/compatible',
+    ANTHROPIC_BASE_URL: 'https://gw-nebula.example.internal/v1',
   });
   try {
     const r = await claudeEgress({ settingsPath: file, env: {}, readProxyClues: false });
-    assert.equal(r.endpointHost, 'llm-abc123.cn-beijing.maas.aliyuncs.com');
+    assert.equal(r.endpointHost, 'gw-nebula.example.internal');
     assert.equal(r.nativeAnthropic, false);
     assert.match(r.source, /settings\.json/);
     // 路径段(/compatible)也不许带出去 —— 里面可能藏东西
