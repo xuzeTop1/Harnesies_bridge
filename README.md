@@ -89,7 +89,7 @@ npm run dispatch      # 命令行派发一次(调试用;正常入口是 MCP)
 ## 三层集成,一套事件模型
 
 层级① ACP(ndjson JSON-RPC over stdio,可多轮)、② Claude 兼容 stream-json(双向流)、
-③ 一次性子进程。层级④(宿主本地 API/CDP)与⑤( computer-use )在 PLAN.md 里标为未公开接口,
+③ 一次性子进程。层级④(宿主本地 API/CDP)与⑤(computer-use)在 PLAN.md 里标为未公开接口,
 **桥目前不实现**。
 
 差异只允许藏在 adapter 里,对外统一成:
