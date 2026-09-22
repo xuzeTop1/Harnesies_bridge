@@ -129,7 +129,7 @@ Anthropic 端点、端点是从哪一层读到的、以及本机代理线索。
 
 ```
 src/
-  types.ts        统一模型:TaskSpec / Adapter / BridgeEvent / 三道闸门的类型约束
+  types.ts        统一模型:TaskSpec / Adapter / BridgeEvent / 四道闸门的类型约束
   scheduler.ts    派发、并发、预算、隔离、事件累积与终态不变量
   worktree.ts     写任务的 git worktree 隔离与 diff 回收
   egress.ts       数据去向自报(端点主机、是否原生、代理线索)
