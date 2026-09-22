@@ -310,8 +310,7 @@ test('models():自报的给清单;不自报的必须 declared:false + 空清单 
   assert.match(q.source, /未知|不要填/, '未声明时要给出可读的原因,而不是留空让人误解为"没有模型"');
 });
 
-test('codebuddy 确实能自报清单(锚点断言,避免随版本漂移而误红)', async () => {
-  const cb = adapters.find((a) => a.id === 'codebuddy');
+test('codebuddy 确实能自报清单(锚点断言,避免随版本漂移而误红)', async () => {  const cb = adapters.find((a) => a.id === 'codebuddy');
   const catalog = await cb.listModels();
   assert.ok(catalog, 'codebuddy 的 --help 里有 "Currently supported: (...)",应能解析出来');
   assert.ok(catalog.models.includes('auto'), 'auto 是它列表里的第一项,用户要的"AUTO 默认"是原生取值');
@@ -321,4 +320,86 @@ test('codebuddy 确实能自报清单(锚点断言,避免随版本漂移而误�
   );
   assert.match(catalog.source, /--help/, '出处要能回答"这是哪条命令说的"');
   assert.ok(catalog.checkedAt > 0, '清单会漂移,必须带核查时间');
+});
+
+/**
+ * opencode:层级③ 的第四个 worker,但**只声明 read-only**。
+ * 这三条守的是铁律二 —— `--auto` 的官方自述是 "auto-approve permissions that are not
+ * explicitly denied (dangerous!)",所以写档位不是"还没做",而是**刻意不做**,
+ * 必须由调度器在派发阶段就拒掉,不能让它跑起来再静默失败。
+ */
+test('opencode 已注册,且只声明 read-only', () => {
+  const oc = adapters.find((a) => a.id === 'opencode');
+  assert.ok(oc, '注册表里应有 opencode');
+  assert.equal(oc.tier, 3);
+  assert.deepEqual(oc.supportedApprovals, ['read-only'], '写档位需要 --auto(dangerous),不得声明');
+});
+
+test('opencode 的 plan():read-only 可构造且不出现 --auto;其它档位当场抛错', async () => {
+  const at = (args, flag) => {
+    const i = args.indexOf(flag);
+    return i >= 0 ? args[i + 1] : undefined;
+  };
+  const { createOpencodeAdapter } = await import('../src/adapters/opencode.ts');
+  const oc = createOpencodeAdapter();
+  const base = {
+    taskId: 't',
+    harness: 'opencode',
+    prompt: 'p',
+    cwd: 'D:/LLMS_Bridge',
+    budget: { maxWallMs: 1000 },
+    session: { mode: 'fresh' },
+  };
+
+  // 未探测就 plan() 必须拒绝,而不是给一条坏命令
+  assert.throws(() => oc.plan({ ...base, approval: 'read-only' }), /未探测/);
+
+  assert.equal((await oc.detect()).available, true, '本机应能探测到 opencode');
+  const plan = oc.plan({ ...base, approval: 'read-only', model: 'opencode/big-pickle' });
+  assert.ok(plan.args.includes('run'), '应走一次性 run');
+  assert.equal(at(plan.args, '--format'), 'json', '必须要求 JSON 事件输出,否则没法解析');
+  assert.equal(at(plan.args, '--model'), 'opencode/big-pickle');
+  assert.ok(
+    !plan.args.some((a) => String(a).includes('auto')),
+    `绝不得出现 --auto(它自述 dangerous),实际:${plan.args.join(' ')}`,
+  );
+  assert.equal(plan.args[plan.args.length - 1], 'p', 'prompt 必须是最后一个位置参数');
+
+  for (const approval of ['workspace-write', 'full']) {
+    assert.throws(() => oc.plan({ ...base, approval }), /read-only/, `${approval} 应被当场拒绝`);
+  }
+});
+
+test('opencode 的解析器:text 累积、step_finish 折算 usage(含缓存 token)', async () => {
+  const { createOpencodeAdapter } = await import('../src/adapters/opencode.ts');
+  const oc = createOpencodeAdapter();
+  await oc.detect();
+  const run = oc.createRun({ taskId: 't2', session: { mode: 'fresh' } }, 't2');
+
+  const e1 = run.parseLine(
+    JSON.stringify({ type: 'text', part: { text: 'hel' } }),
+  );
+  const e2 = run.parseLine(
+    JSON.stringify({ type: 'text', part: { text: 'lo' } }),
+  );
+  assert.equal(e1[0]?.type, 'message');
+  assert.equal(e2[0]?.type, 'message');
+
+  const e3 = run.parseLine(
+    JSON.stringify({
+      type: 'step_finish',
+      part: { tokens: { input: 100, output: 7, cache: { read: 50, write: 3 } }, cost: 0 },
+    }),
+  );
+  assert.equal(e3[0]?.type, 'status');
+
+  assert.equal(run.parseLine('not json').length, 0, '非 JSON 行应忽略而不是崩');
+
+  const fin = run.finalize(0);
+  assert.equal(fin.text, 'hello', '多段 text 要累积成完整答案');
+  assert.deepEqual(
+    fin.usage,
+    { inputTokens: 153, outputTokens: 7 },
+    'input 必须把缓存读/写算进去,否则成本被低估',
+  );
 });

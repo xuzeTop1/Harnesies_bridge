@@ -2,6 +2,7 @@ import type { Adapter } from './types.ts';
 import { createCodexAdapter } from './adapters/codex.ts';
 import { createClaudeAdapter } from './adapters/claude.ts';
 import { createCodeBuddyAdapter } from './adapters/codebuddy.ts';
+import { createOpencodeAdapter } from './adapters/opencode.ts';
 import { createAcpAdapter } from './adapters/acp.ts';
 
 /**
@@ -10,8 +11,11 @@ import { createAcpAdapter } from './adapters/acp.ts';
  * 层级① 的 ACP 方言差异只在"怎么进入 ACP 模式"这一个参数上,所以共用一个 adapter 工厂:
  * Gemini / Qwen 用 flag `--acp`,MiMo / OpenClaw 用子命令 `acp`。
  *
- * Gemini 的 `--acp` 本机实测静默无响应(存活但不输出任何字节),故未注册 ——
- * 实现存在但入口不工作,等查明再加。
+ * Gemini 未注册:它的 `--acp` 本机实测静默无响应,而该 CLI 又被 Google 以
+ * "This client is no longer supported for Gemini Code Assist for individuals" 拒绝(见 PLAN §3.6)。
+ *
+ * opencode 单列一个层级③ 适配器,不走 mimo 那条 ACP:mimo 虽是 OpenCode 的套壳,
+ * 但 `opencode run` 有 `--format json` 与 443 个自报模型,比 ACP 路径好接且模型面宽得多。
  */
 export function createAdapters(): Adapter[] {
   return [
@@ -36,6 +40,7 @@ export function createAdapters(): Adapter[] {
       acpArgs: ['acp'],
     }),
     createCodeBuddyAdapter(),
+    createOpencodeAdapter(),
     createClaudeAdapter(),
     createCodexAdapter(),
   ];

@@ -77,7 +77,8 @@ Ollama 0.31.1(`D:\Ollama`,模型 `D:\Ollama_Model`)——本地零边际成本�
 | Claude Code | ~~`402 Insufficient Balance`~~ → **2026-09-19 15:35 已解封** | 无需动作(用户已重置 deepseek 额度) | 桥内真派发实测:`status: ok`、`text: "pong"`、`init model=deepseek-v4-flash[1m] mode=plan`、4.5s。**注意成本:一个单词回复烧了 30169 input tokens**(系统提示开销) |
 | Qwen Code | ACP 通,`session/new` 返 `-32000 Authentication required` | 二选一:跑 `qwen --auth-type=openai`,或设 `OPENAI_API_KEY` 环境变量 | `initialize` 返回的 `authMethods[0]._meta.args = ["--auth-type=openai"]` |
 | Gemini CLI | **已不再是"未登录"**:带代理环境变量后 OAuth 登录成功,但 Google 判决页列**四个产品全未授权**(Code Assist / Cloud Code / Gemini CLI / Antigravity) | 只剩两条:`--project_id` 绑档位,或 AI Studio `GEMINI_API_KEY`。目录信任已不是瓶颈 | 实测见 §3.6 |
-| MiMo | ACP 会话以 `end_turn` 结束但**零文本零 usage** | 配模型(**未核实**具体做法) | 实测会话正常结束却无产出 |
+| MiMo | ACP 会话以 `end_turn` 结束但**零文本零 usage** | 配模型(**未核实**具体做法)。注意 `mimo acp` 自报 agent 名是 `OpenCode 0.1.6` —— **MiMo 是 OpenCode 的套壳**,且它的 provider 与 opencode 本体**分开存**(见下一行) | 实测会话正常结束却无产出 |
+| **opencode** | ~~npm shim 装坏~~ → **2026-09-21 已修并注册为层级③ worker** | 无需动作。装 `opencode-windows-x64` 后 `--version` = 1.18.32;`~/.local/share/opencode/auth.json` 里**早已配好 5 个 provider**(github-copilot / openrouter / alibaba×3),`opencode models` 自报 **443 个模型 / 7 家提供商**,含 `opencode/big-pickle` 等 free 档(实测零成本产出文本) | 实测 `run --format json` 只读任务 `status: ok`;`detect` 走 `resolveGlobalCli` 绕开坏 shim |
 | OpenCode | npm shim 装坏 | `npm i -g opencode-windows-x64`(或 `-baseline`) | 实测报错原文就给了这两个包名 |
 | Antigravity | agentapi 入口与鉴权已通,但 agent 不执行 | 已停手,见 §M3 | —— |
 | Qoder CN | —— | 把桥放进项目级 `.mcp.json` / `.qoder/.mcp.json`,再到 Qoder 界面里确认 | app.asar 确认它读这两个文件;**GUI 内验证未做** |
@@ -839,6 +840,11 @@ db 是 **protobuf 字节数组**(`steps`/`gen_metadata`),扫可读 ASCII 只找�
    **翻转的前置:一次已鉴权 ACP agent 的完整写任务实测**(即 §3.5 里 qwen 那条"用户登录"的动作)。
 4. **层级④ 的 worker 通道**。Antigravity 的 `agentapi` 鉴权链已通但 agent 不执行(已停手);
    Qoder 内部运行时被安全护栏拦下(已停手);CDP 驱动未做。
+6. **opencode 的写档位:刻意不做。** 它只有 `--auto` 这一条放行路径,而该旗标的官方自述是
+   *"auto-approve permissions that are not explicitly denied (dangerous!)"* —— 按铁律二,这类绕过审批的
+   开关默认禁用。所以 `supportedApprovals` 只声明 `read-only`,且 `plan()` 对其它档位**当场抛错**
+   (不是跑起来再静默失败)。实测只读可用:不带 `--auto` 时读文件自动放行,不会卡在权限询问上。
+   要开写档必须先回答"用 worktree 隔离换取 `--auto` 是否可接受",那是**用户决策**,不是实现细节。
 5. **M0 的并行多厂商**:并行 worktree 隔离已实现,且已有三家可产出文本
    (codex / codebuddy / claude)。两路并发评审在 `test/cross-review.test.mjs` 的三家投票用例里
    已实测(`Promise.all` 派发,互不干扰)。**尚未做的**是"同一任务并行派给多家、再比对/合并产出"
