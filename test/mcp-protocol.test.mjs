@@ -15,6 +15,9 @@ import { tmpdir } from 'node:os';
 const PROJECT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SERVER = join(PROJECT, 'src', 'mcp-server.ts');
 
+// 账本索引默认写在 ~/.llms-bridge/;子进程继承环境,所以这里设了它就够(LLMS_BRIDGE_LIVE 那条会真派发)。
+process.env.LLMS_BRIDGE_HOME = join(tmpdir(), `llms-bridge-test-home-${process.pid}`);
+
 /** 起一个 MCP server 子进程,返回一个 request(id) → response 的调用器。 */
 function startServer() {
   const child = spawn(process.execPath, [SERVER], { stdio: ['pipe', 'pipe', 'pipe'], cwd: PROJECT });

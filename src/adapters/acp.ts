@@ -6,6 +6,7 @@ import type {
   BridgeEvent,
   DetectResult,
   EventType,
+  ModelCatalog,
   RunParser,
   SpawnPlan,
   TaskSpec,
@@ -42,17 +43,16 @@ import type { ResolvedCli } from '../locate.ts';
 const ACP_PROTOCOL_VERSION = 1;
 
 /**
- * 层级① 尚未接的 spec 选项。**两个都是 false 意味着"传了也不生效"**。
+ * 层级① 尚未接的 spec 选项。**false 意味着"传了也不生效"**。
  *
- * - 模型选择:ACP 里大概走 `session/new` 的模型字段或单独的 set-model 方法;
  * - 会话选择:resume / fork 在 ACP 里对应 loadSession / 会话列表(能力里确实报了
  *   `sessionCapabilities: {list, resume}`),但本机几家都没到能验证那一步。
  *
- * 两处都**不照记忆猜字段名**。传了不会被采纳,但也不会静默丢弃 ——
- * 由 `unsupportedOptionEvents()` 在连接后显式回一条 error 事件。
- * 需要模型级差异请用 codex / claude(层级②③)。
+ * 传了不会被采纳,但也不会静默丢弃 —— 由 `unsupportedOptionEvents()` 显式回一条 error 事件。
+ *
+ * (模型选择**已接**,不在此列:`session/set_model` 实测于 2026-09-23 在 mimo 与 qwen 上
+ * 都有效,清单解析与"清单里没有就中止"见 `modelCatalogFromSessionResult` / `createRun`。)
  */
-const ACP_MODEL_SELECTION_WIRED = false;
 const ACP_SESSION_SELECTION_WIRED = false;
 
 /**
@@ -78,6 +78,67 @@ interface AcpInitResult {
   authMethodCount: number;
   /** session/new 失败时的原因(通常是未鉴权)。 */
   sessionError?: string;
+  /** session/new 的原样返回 —— 模型清单就摊在里面,别处拿不到。 */
+  sessionResult?: unknown;
+}
+
+/**
+ * 从 `session/new` 的返回里解析"这个 agent 自己说它有哪些模型"。
+ *
+ * 两种形状都是实测来的(2026-09-23),不是照 ACP 规范推的:
+ *   ① `result.configOptions[]` 里有一项选择器 `category:"model"`,可选项在
+ *      `options[].value`(如 `mimo/mimo-auto`),当前值在 `currentValue`。
+ *      mimo(OpenCode 0.1.6)报 30 个,qwen(0.24.4)报 14 个 —— **这是两家共有的形状**。
+ *   ② `result.models = { currentModelId, availableModels:[{modelId, name}] }`。
+ *      2026-09-23 复核:qwen 两种形状**同时**都报,14 个 id 与顺序完全一致;
+ *      mimo 没见到这一节。所以它是兜底,给只报这一种的 agent 用。
+ *
+ * 认不出形状就返回 null(→"未知"),绝不填一份看着合理的清单 —— AGENTS.md 证据纪律。
+ * `currentValue` 一并写进 `source`:它回答"不点名模型时实际会跑哪个",而调用方
+ * 恰好在乎这一点。
+ *
+ * ① 先于 ② 试是安全的:qwen 上两者等价,所以预检("清单里没有就中止")不会因为
+ * 选了哪个形状而误拒。
+ */
+export function modelCatalogFromSessionResult(sessionResult: unknown, checkedAt: number): ModelCatalog | null {
+  if (sessionResult === null || typeof sessionResult !== 'object') return null;
+  const r = sessionResult as Record<string, any>;
+
+  const options = Array.isArray(r.configOptions) ? r.configOptions : [];
+  const selector = options.find((o: any) => o?.category === 'model' || o?.id === 'model');
+  if (selector) {
+    const models = (Array.isArray(selector.options) ? selector.options : [])
+      .map((o: any) => (typeof o?.value === 'string' && o.value.length > 0 ? o.value : null))
+      .filter((v: string | null): v is string => v !== null);
+    if (models.length > 0) {
+      return {
+        models,
+        source: `ACP session/new 的 configOptions[category=model],当前 ${String(selector.currentValue ?? '?')}`,
+        checkedAt,
+      };
+    }
+  }
+
+  const modelsField = r.models;
+  if (modelsField !== null && typeof modelsField === 'object') {
+    const models = (Array.isArray(modelsField.availableModels) ? modelsField.availableModels : [])
+      .map((o: any) => (typeof o?.modelId === 'string' && o.modelId.length > 0 ? o.modelId : null))
+      .filter((v: string | null): v is string => v !== null);
+    if (models.length > 0) {
+      return {
+        models,
+        source: `ACP session/new 的 models.availableModels,当前 ${String(modelsField.currentModelId ?? '?')}`,
+        checkedAt,
+      };
+    }
+  }
+
+  return null;
+}
+
+/** `session/set_model` 的请求体。抽出来是为了让"发了什么"能被用例直接断言。 */
+export function sessionSetModelRequest(sessionId: string, modelId: string, id: number): unknown {
+  return { jsonrpc: '2.0', id, method: 'session/set_model', params: { sessionId, modelId } };
 }
 
 /**
@@ -140,6 +201,7 @@ function acpProbe(cli: ResolvedCli, acpArgs: string[], timeoutMs: number): Promi
           send({ jsonrpc: '2.0', id: 2, method: 'session/new', params: { cwd: process.cwd(), mcpServers: [] } });
         } else if (msg.id === 2) {
           if (msg.error) result.sessionError = String(msg.error.message ?? msg.error.code);
+          else result.sessionResult = msg.result;
           finish();
         }
       }
@@ -164,6 +226,9 @@ function createRun(spec: TaskSpec, taskId: string, harness: string): RunParser {
   let fatal: string | undefined;
   let finished = false;
 
+  // 点名了模型就多一步 `session/set_model`,id 也得往后挪一位。
+  const promptId = spec.model === undefined ? 3 : 4;
+
   const event = (type: EventType, extra: Partial<BridgeEvent> = {}): BridgeEvent => ({
     taskId,
     seq: seq++,
@@ -184,9 +249,6 @@ function createRun(spec: TaskSpec, taskId: string, harness: string): RunParser {
    */
   const unsupportedOptionEvents = (): BridgeEvent[] => {
     const ignored: string[] = [];
-    if (!ACP_MODEL_SELECTION_WIRED && spec.model !== undefined) {
-      ignored.push(`model=${spec.model}(实际用该 agent 的默认模型)`);
-    }
     if (!ACP_SESSION_SELECTION_WIRED && spec.session.mode !== 'fresh') {
       ignored.push(`session.mode=${spec.session.mode}(层级① 每次新建会话,不支持 resume/fork)`);
     }
@@ -381,15 +443,51 @@ function createRun(spec: TaskSpec, taskId: string, harness: string): RunParser {
             finished = true;
             return [event('error', { text: fatal, raw: msg })];
           }
+
+          if (spec.model !== undefined) {
+            // 先拿 agent 自己刚报的清单挡一道:它没列过的模型,`set_model` 很可能照收不误
+            // (mimo 就收下了自己列表里那个 `mimo/mimo-auto`),然后在上游以
+            // "end_turn + 零文本 + 零 usage" 沉默地失败。宁可在这一步明确拒绝。
+            // 只在清单**非空**时挡 —— 取不到清单是"未知",不能当"没有"用。
+            const catalog = modelCatalogFromSessionResult(msg.result, Date.now());
+            if (catalog && !catalog.models.includes(spec.model)) {
+              fatal =
+                `该 agent 自己报的模型清单里没有 "${spec.model}" —— 已中止,未发提示词。` +
+                `它报的可选值(${catalog.source}):${catalog.models.join(', ')}`;
+              finished = true;
+              return [event('error', { text: fatal, raw: msg })];
+            }
+            // 注意:`session/new` 的 `modelId` 参数实测**被忽略**(mimo 传了它,currentValue 没变),
+            // 只有这个独立方法生效 —— 别"顺手"把模型挪回 session/new。
+            send(sessionSetModelRequest(sessionId, spec.model, 3));
+            return [event('status', { text: `session=${sessionId},设置模型 ${spec.model}`, raw: msg })];
+          }
+
           send({
             jsonrpc: '2.0',
-            id: 3,
+            id: promptId,
             method: 'session/prompt',
             params: { sessionId, prompt: [{ type: 'text', text: spec.prompt }] },
           });
           return [event('status', { text: `session=${sessionId}`, raw: msg })];
         }
-        if (msg.id === 3) {
+        if (spec.model !== undefined && msg.id === 3) {
+          if (msg.error) {
+            // 这里不能"退回默认模型接着跑":调用方点名了模型,退回等于用别的模型交了一份结果,
+            // 而它不会知道 —— 派发要的就是可追溯。
+            fatal = `设置模型失败 "${spec.model}":${String(msg.error.message ?? msg.error.code)} —— 已中止,未发提示词`;
+            finished = true;
+            return [event('error', { text: fatal, raw: msg })];
+          }
+          send({
+            jsonrpc: '2.0',
+            id: promptId,
+            method: 'session/prompt',
+            params: { sessionId, prompt: [{ type: 'text', text: spec.prompt }] },
+          });
+          return [event('status', { text: `模型已设为 ${spec.model}`, raw: msg })];
+        }
+        if (msg.id === promptId) {
           if (msg.error) {
             fatal = String(msg.error.message ?? msg.error.code);
           } else {
@@ -502,6 +600,20 @@ export function createAcpAdapter(config: AcpAdapterConfig): Adapter {
         args: [...cli.prefixArgs, ...acpArgs],
         needsStdin: true,
       };
+    },
+
+    /**
+     * 清单来自 ACP 自己的 `session/new` 返回,**不是我们整理的**。
+     *
+     * 取一次要真起一个进程走完握手(冷启动可能十几秒),所以这里不自己缓存 ——
+     * 调度器已经按进程缓存了(`scheduler.ts` 的 modelCache),再叠一层只会让
+     * "什么时候取的"更难说清。解析不出形状就返回 null,调用方渲染成"未知"。
+     */
+    async listModels(): Promise<ModelCatalog | null> {
+      if (!cli) return null; // 未探测;调度器保证先跑过 detectAll()
+      const probe = await acpProbe(cli, acpArgs, 25_000);
+      if (!probe || probe.sessionResult === undefined) return null;
+      return modelCatalogFromSessionResult(probe.sessionResult, Date.now());
     },
 
     createRun: (spec, taskId) => createRun(spec, taskId, config.id),

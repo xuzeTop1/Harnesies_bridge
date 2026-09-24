@@ -86,6 +86,28 @@ npm run dispatch      # 命令行派发一次(调试用;正常入口是 MCP)
 之后 `harness_poll` 看是否结束 → `harness_result` 取文本/用量/diff → `harness_events` 看过程。
 写任务要把 `approval` 提到 `workspace-write`,桥会自动给它分配独立 worktree,源工作区不动。
 
+worktree 的形态由调用方显式选(默认永远是"新建 + 隔离"):
+
+| 参数 | 效果 | 结果里的标记 |
+| --- | --- | --- |
+| 都不给 | 在 `cwd` 的仓库里新建 `--detach` worktree | `isolated: true` + `worktree_path` |
+| `reuse_worktree_path` | 复用已有 worktree(仅写档;先验"同仓库且非主工作区") | `isolated: true` |
+| `allow_unisolated_write: true` | 直接写 `cwd`(git 仓库里也生效) | `isolated: false` |
+
+仓库级"数据能不能出本机"写在 `<仓库>/.llms-bridge/policy.json`(**文件不存在＝不限制**):
+
+```jsonc
+{ "cloud": { "allowHarnesses": ["claude"] } }   // 空数组 = 只允许端点在本机的 harness
+```
+
+端点**未知**一律按不可信处理 —— 今天只有 claude 自报 egress,所以空名单下它以外的都会被拒;
+文件坏掉或键名写错也按拒处理(建它是为了限制,解析失败不该悄悄解除)。
+
+任务状态只在进程内存里,但**账本落盘**:派发即写 `<cwd>/.llms-bridge/tasks/<taskId>.json`
+(含 prompt、结果正文、状态、用量、egress 主机),索引在 `~/.llms-bridge/tasks-index.jsonl`。
+宿主重启后 `harness_poll` / `harness_result` 会自动回退读账本,返回 `fromJournal: true`
+(事件流不落盘,无法回放);记录停在 `running` 表示持有它的进程消失了。
+
 ## 三层集成,一套事件模型
 
 层级① ACP(ndjson JSON-RPC over stdio,可多轮)、② Claude 兼容 stream-json(双向流)、
@@ -103,10 +125,13 @@ ACP 的探测超时算"未判定"而不是"不可用"——会重试一次更宽
 1. **凭证**:桥不读、不存、不转发任何云端厂商密钥,无例外。只复用各家 CLI 自己的登录态。
    唯一例外是宿主自己写在配置里的 **localhost 服务 token**,按字段白名单就地只读使用(见 AGENTS.md §1.1)。
 2. **审批**:见上,必填无默认;绕过类档位必须用户当次点名。
-3. **隔离**:可能改盘的 worker 一律分到独立 git worktree(`--detach`),源工作区不动;
-   非 git 目录下的写任务默认拒绝,除非调用方显式传 `allow_unisolated_write`,且结果必须标
-   `isolated: false`。产物以 diff 回收,**不自动合并**。容器目录 `.llms-bridge/` 与 `.scratch/`
+3. **隔离**:可能改盘的 worker 一律分到独立 git worktree(`--detach`),源工作区不动。
+   默认永远是"新建 + 隔离";`reuse_worktree_path`(复用已有 worktree,仅写档)与
+   `allow_unisolated_write`(直接写 cwd,**git 仓库里也生效**)都必须显式传,且放弃隔离时
+   结果/ack/账本三处都标 `isolated: false`。非 git 目录下的写任务默认拒绝。
+   产物以 diff 回收,**不自动合并**。容器目录 `.llms-bridge/` 与 `.scratch/`
    都在 `.gitignore` 里;清理 worktree 默认是 dry-run,要 `confirm` 才删,且只删桥自己创建的。
+   仓库级"数据能否出本机"另有一道:见上方 `policy.json`。
 4. **预算**:`max_wall_ms` 到点中断整棵进程树并标 `timeout`;超限不许偷偷换更贵的模型续跑。
 
 产物 diff 有上限(`LLMS_BRIDGE_DIFF_CAP`,默认 200KB)。超限时 `diffTruncated: true` ——
@@ -131,7 +156,9 @@ Anthropic 端点、端点是从哪一层读到的、以及本机代理线索。
 src/
   types.ts        统一模型:TaskSpec / Adapter / BridgeEvent / 四道闸门的类型约束
   scheduler.ts    派发、并发、预算、隔离、事件累积与终态不变量
-  worktree.ts     写任务的 git worktree 隔离与 diff 回收
+  worktree.ts     写任务的 git worktree 隔离、复用校验与 diff 回收
+  journal.ts      任务账本:进程消失后仍能回答"派发过什么、最后怎样、产出了什么"
+  policy.ts       仓库级云策略(数据能不能出本机)
   egress.ts       数据去向自报(端点主机、是否原生、代理线索)
   locate.ts       找到各家真二进制(Windows 的 shim 不能直接 spawn)
   proc.ts         子进程与 stdout 逐行喂给 parser;超时杀进程树

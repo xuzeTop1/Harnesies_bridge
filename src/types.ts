@@ -51,8 +51,23 @@ export interface TaskSpec {
    * 放弃 worktree 隔离的显式开关。
    * 写任务在非 git 目录下默认被拒(AGENTS.md 铁律三要求独立 worktree);
    * 确实不需要隔离时由调用方显式声明,并在结果里标记 isolated=false。
+   *
+   * 2026-09-24 起**在 git 仓库里同样生效**(此前 git 仓库是无条件分配 worktree,
+   * 这个开关被忽略)。用户要求把"这次要不要 worktree"交给调用方决定,但默认仍是新建+隔离,
+   * 放弃隔离必须显式,且 ack/结果/账本三处都会标 `isolated: false` —— 不许混成"隔离了"。
    */
   allowUnisolatedWrite?: boolean;
+  /**
+   * 复用**已有** worktree 当工作目录(多轮任务共用一份工作区,如 R7 那种人工建好的)。
+   * **写档专用**:只读档传它会当场被拒(只读不分配 worktree;想让它读某个工作区的快照,
+   * 直接把 cwd 指过去即可)。
+   *
+   * 为什么不直接把它当 cwd:实测会**嵌套**出一层新的 `A/.llms-bridge/worktrees/<新id>`,
+   * 而不是复用 A。走这个字段时桥会先验:同仓库的、且**不是主工作区**的独立 worktree
+   * (验不过当场拒)。写任务在这条路上会回收该 worktree 里**全部未提交改动**的 diff,
+   * 不只本轮 —— 多轮共用时请把它当成预期行为。
+   */
+  reuseWorktreePath?: string;
 }
 
 export type EventType =
@@ -95,7 +110,12 @@ export interface TaskResult {
   usage?: Usage;
   eventCount: number;
   startedAt: number;
-  endedAt: number;
+  /**
+   * 桥**观测到**结束的时刻。缺失只出现在一种情况:从账本里读回来的记录停在 `running`
+   * (持有它的桥进程消失了,没人观测到结束)。那时**不许**用 startedAt 顶替 ——
+   * 那会让"被中断"看起来像"开始即结束",据此判断时序会得出完全错误的结论。
+   */
+  endedAt?: number;
   /** 非 ok 时说明原因(超时 / 超预算 / 退出码 / 审批拒绝)。 */
   reason?: string;
   /** 是否给该 worker 分配了独立 worktree。 */
@@ -115,6 +135,12 @@ export interface TaskResult {
    * 无 diff 时为 undefined,有 diff 未截断时为 false。
    */
   diffTruncated?: boolean;
+  /**
+   * 该结果来自**落盘账本**而非本进程内存:任务由上一个桥进程派发(宿主重启等),进程已消失。
+   * 此时 `text` 等字段仍然可信,但 `eventCount` 为 0 —— 事件流只在内存里,无法回放。
+   */
+  fromJournal?: boolean;
+  journalPath?: string;
 }
 
 export interface DetectResult {

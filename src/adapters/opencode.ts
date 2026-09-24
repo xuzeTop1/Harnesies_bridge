@@ -21,7 +21,9 @@ const execFileAsync = promisify(execFile);
  * OpenCode CLI —— 层级③(一次性子进程),但带会话续接。
  *
  * 为什么值得单独一个适配器,而不是蹭 mimo 那条 ACP:
- * 它一家就自报 **443 个模型 / 7 家提供商**(`opencode models`),是本机模型面最宽的 worker;
+ * 它一家就自报 **544 个模型 / 7 个 provider 前缀**(`opencode models`,2026-09-24 核;
+ * 同一天早些时候是 443 —— **这个数字会随对方目录漂移,别当契约用**),是本机模型面最宽的 worker;
+ * 而且**目录里有 ≠ 你的账号有权用**:`opencode/`(Zen)前缀在本机根本没有凭据,派了就是 401。
  * 而且 `opencode run` 有 `--format json`(可直接解析)与 `--session/--continue/--fork`(会话语义),
  * 比层级① 的 ACP 路径好接。实测 free 档 `opencode/big-pickle` 零成本可产出文本。
  *
@@ -102,6 +104,8 @@ export function createOpencodeAdapter(): Adapter {
       let seq = 0;
       let text = '';
       let usage: Usage | undefined;
+      /** 对方自己报的错误原话。没它就只能回"退出码 N 且无文本"—— 实测吃过这个亏。 */
+      let vendorError: string | undefined;
       const event = (type: EventType, extra: Partial<BridgeEvent> = {}): BridgeEvent => ({
         taskId,
         seq: seq++,
@@ -134,17 +138,32 @@ export function createOpencodeAdapter(): Adapter {
             }
             return [event('status', { text: `step_finish cost=${obj.part?.cost ?? 0}`, raw: obj })];
           }
+          if (obj.type === 'error') {
+            // 实测(2026-09-24):`opencode/` 这个 provider 通道 key 无效时,它把
+            // `401 Invalid API key` 以**这个**事件发在 **stdout** 上(stderr 是空的)。
+            // 不认这个事件类型,调用方就只能看到"退出码 1 且无文本" —— 对方已经把原因说清楚了,桥必须转达。
+            const status = obj.error?.data?.statusCode;
+            const message =
+              obj.error?.data?.message ?? obj.error?.message ?? obj.error?.name ?? JSON.stringify(obj.error ?? {});
+            vendorError = `${String(message)}${status === undefined ? '' : ` (HTTP ${String(status)})`}`;
+            return [event('error', { text: vendorError, raw: obj })];
+          }
           return [];
         },
 
         finalize(exitCode: number) {
+          const hasText = text.trim().length > 0;
           return {
-            text: text.trim() || undefined,
+            text: hasText ? text.trim() : undefined,
             usage,
-            errorText:
-              exitCode === 0 || text.trim().length > 0
-                ? undefined
-                : `opencode 退出码 ${exitCode} 且无文本输出`,
+            // 有正文就算成功(错误可能只是一次失败重试);没正文时,对方的原话优先于我们编的通用句子。
+            errorText: hasText
+              ? undefined
+              : (vendorError !== undefined
+                ? `opencode 报错:${vendorError}(退出码 ${exitCode})`
+                : exitCode === 0
+                  ? undefined
+                  : `opencode 退出码 ${exitCode} 且无文本输出`),
           };
         },
       };

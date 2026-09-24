@@ -16,6 +16,8 @@ import { tmpdir } from 'node:os';
 import { join, normalize } from 'node:path';
 
 process.env.LLMS_BRIDGE_DIFF_CAP = '4000';
+// 账本索引默认写在 ~/.llms-bridge/,跑测试不该碰用户真实目录(journal.ts 惰性读这个变量)。
+process.env.LLMS_BRIDGE_HOME = join(tmpdir(), `llms-bridge-test-home-${process.pid}`);
 
 const { Scheduler } = await import('../src/scheduler.ts');
 

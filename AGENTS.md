@@ -52,13 +52,29 @@ WorkBuddy / Qwen / 其它接入的 worker),以及人。
 - 任何可能改动文件的 worker,必须先分配独立 git worktree,不允许两个 worker 共享工作目录。
 - **已实现**(`src/worktree.ts`):写任务在 git 仓库下自动分配 `--detach` worktree,
   worker 的 cwd 被换成它,**源仓库不动**。
-- 非 git 目录下的写任务**默认拒绝**。确实不需要隔离时,由调用方显式传
-  `allowUnisolatedWrite: true`(MCP 参数 `allow_unisolated_write`)才放行,
-  且结果必须标记 `isolated: false` —— 不许把"没隔离"混成"隔离了"。
+- **默认永远是"新建 + 隔离"**;三种形态由调用方显式选(2026-09-24 经用户确认放开):
+  `reuseWorktreePath`(复用已有 worktree,仅写档;桥会先验"同仓库且非主工作区")、
+  `allowUnisolatedWrite: true`(直接写 cwd,**git 仓库里也生效**)、什么都不给(新建 worktree)。
+- 放弃隔离必须**显式**,且结果、ack、账本三处都标 `isolated: false` ——
+  不许把"没隔离"混成"隔离了"。非 git 目录下的写任务**默认拒绝**。
+- 只读档不分配 worktree;给它传 `reuseWorktreePath` 会被**明确拒绝并指路**(想读某个
+  worktree 的快照就把 cwd 指过去),不许静默忽略,也不许给它标 `isolated: true`
+  —— 只读 worker 仍能按绝对路径读到源仓库,标了就是过度宣称。
 - worker 产出以 `diff` 事件回收,**不直接合并**。worktree 保留不删,路径在结果里回传。
 - 容器目录 `.llms-bridge/` 写进仓库本地的 `.git/info/exclude`,不改版本化的 `.gitignore`
   (不该因为桥跑了一次就污染用户的 diff)。
 - 未经用户确认,不得把 worker 的改动合并或推送到任何远端。
+
+### 3.1 数据去向:仓库级云策略
+
+- 只读档的 worker **照样会把仓库内容发给模型** —— "只读"约束的是改不改文件,与数据去向无关。
+- 语义(`src/policy.ts`,读 `<仓库>/.llms-bridge/policy.json`,文件本身进 `info/exclude`):
+  - 文件**不存在** = 不限制(不给所有既有仓库加一道默认拒绝);
+  - 文件存在 = 白名单:`cloud.allowHarnesses` 非空则 harness 必须在名单里;名单为空则只放行
+    **自报端点在本机**的 harness;
+  - **端点未知一律按不可信处理**。全机只有 claude 自报 egress,所以"不自报"在空名单下会被拒 ——
+    把"不知道"当"安全"是本项目最忌的静默降级;
+  - 文件坏掉/键名写错 = **拒**(用户建它是为了限制,解析失败不该悄悄解除限制)。
 
 ### 4. 成本:每个任务都要有上限
 

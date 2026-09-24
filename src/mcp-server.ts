@@ -81,7 +81,14 @@ const TOOLS = [
         allow_unisolated_write: {
           type: 'boolean',
           description:
-            '写任务在非 git 目录下默认被拒(要求独立 worktree)。确实不需要隔离时显式给 true,结果会标记 isolated=false',
+            '放弃 worktree 隔离:让 worker 直接写 cwd(git 仓库里也生效)。默认是新建独立 worktree,' +
+            '给 true 等于让它在无人确认下改你的源仓库 —— 结果与 ack 都会标 isolated=false',
+        },
+        reuse_worktree_path: {
+          type: 'string',
+          description:
+            '复用已有 worktree 当工作目录(多轮任务共用一份工作区),只接受同仓库、非主工作区的独立 worktree,' +
+            '验不过当场拒。写任务回收的是该 worktree 里全部未提交改动的 diff,不只本轮',
         },
         resume_session_id: { type: 'string', description: '恢复指定会话(层级②③支持)' },
         fork_session_id: { type: 'string', description: '从指定会话 fork 出新分支(层级②支持)' },
@@ -189,6 +196,8 @@ async function callTool(name: string, args: Record<string, unknown>) {
         model: typeof args.model === 'string' ? args.model : undefined,
         allowedFull: args.allow_full === true,
         allowUnisolatedWrite: args.allow_unisolated_write === true,
+        reuseWorktreePath:
+          typeof args.reuse_worktree_path === 'string' ? args.reuse_worktree_path : undefined,
       };
 
       // 不在这里 await detectAll():dispatch 会在**校验之后**自己等探测,

@@ -42,8 +42,11 @@ export interface Worktree {
  *
  * 用 `.git/info/exclude` 而不是 `.gitignore`:后者是被跟踪的版本化文件,
  * 不该因为桥跑了一次就出现在用户的 diff 里。写在 info/exclude 只影响本仓库,且不产生 diff。
+ *
+ * 由 `allocateWorktree()` 和账本(`src/journal.ts`)共同调用 —— 只读任务不分配 worktree,
+ * 但它也会往 `.llms-bridge/` 里写账本,同样不能让那目录出现在 `git status` 里。
  */
-async function ensureExcluded(repoRoot: string): Promise<void> {
+export async function ensureBridgeDirExcluded(repoRoot: string): Promise<void> {
   const r = await git(repoRoot, ['rev-parse', '--git-dir']);
   if (!r.ok) return;
   const gitDir = r.stdout.trim();
@@ -70,7 +73,7 @@ export async function allocateWorktree(repoRoot: string, taskId: string): Promis
   const short = taskId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16);
   const path = join(base, WORKTREE_DIRNAME, WORKTREE_SUBDIR, short);
   await mkdir(join(base, WORKTREE_DIRNAME, WORKTREE_SUBDIR), { recursive: true });
-  await ensureExcluded(base);
+  await ensureBridgeDirExcluded(base);
 
   const r = await git(base, ['worktree', 'add', '--detach', path, 'HEAD']);
   if (!r.ok) {
@@ -96,6 +99,48 @@ export async function captureDiff(worktreePath: string): Promise<{ patch: string
 export async function removeWorktree(repoRoot: string, worktreePath: string): Promise<void> {
   await git(repoRoot, ['worktree', 'remove', '--force', worktreePath]);
   await git(repoRoot, ['worktree', 'prune']);
+}
+
+/**
+ * 校验一个**已有**目录能不能当本次派发的隔离工作区(多轮任务共用一个 worktree)。
+ *
+ * 存在的理由:实测把已有 worktree 当 cwd 再派写任务,git 允许嵌套,于是会造出
+ * `A/.llms-bridge/worktrees/<新id>` 一层套一层,而不是复用 A。
+ *
+ * **必须逐条验,不能只信路径**:这是"复用别人建好的工作区"的入口,不验就贴 `isolated: true`,
+ * 等于开后门把铁律三的隔离保证变成一句谎话(随手传个 `C:\` 就"有隔离"了)。判据全是 git 自己说的:
+ *   1. 存在且是目录;
+ *   2. 是 git 工作区;
+ *   3. 与主仓库**同属一个仓库**(git-common-dir 相同);
+ *   4. 不是主工作区本身(`git-dir == git-common-dir` 即主工作区 —— 复用主工作区就是直接写源仓库)。
+ */
+export async function resolveReusableWorktree(repoCwd: string, candidate: string): Promise<string> {
+  const abs = resolve(candidate);
+  const st = await stat(abs).catch(() => null);
+  if (!st?.isDirectory()) throw new Error(`复用目标不是已存在的目录: ${abs}`);
+
+  const candGit = await git(abs, ['rev-parse', '--git-dir']);
+  const candCommon = await git(abs, ['rev-parse', '--git-common-dir']);
+  if (!candGit.ok || !candCommon.ok) throw new Error(`复用目标不是 git 工作区: ${abs}`);
+
+  const repoCommon = await git(repoCwd, ['rev-parse', '--git-common-dir']);
+  if (!repoCommon.ok) throw new Error(`无法确认主仓库(${repoCwd})的 git 目录`);
+
+  // 两个响应都可能是相对路径,统一按各自的工作区解析成绝对路径再比。
+  const candCommonAbs = resolve(abs, candCommon.stdout.trim());
+  const repoCommonAbs = resolve(repoCwd, repoCommon.stdout.trim());
+  if (candCommonAbs !== repoCommonAbs) {
+    throw new Error(`复用目标属于另一个仓库(${candCommonAbs} ≠ ${repoCommonAbs}): ${abs}`);
+  }
+
+  const candGitAbs = resolve(abs, candGit.stdout.trim());
+  if (candGitAbs === candCommonAbs) {
+    throw new Error(
+      `复用目标就是该仓库的主工作区(不是独立 worktree):${abs}。` +
+        `复用它等于让 worker 直接改源仓库,却标 isolated=true —— 要这么干请改用 allowUnisolatedWrite=true(结果会标 isolated=false)。`,
+    );
+  }
+  return abs;
 }
 
 export interface WorktreeEntry {

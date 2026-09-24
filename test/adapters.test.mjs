@@ -6,8 +6,13 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createAdapters } from '../src/registry.ts';
 import { Scheduler } from '../src/scheduler.ts';
+
+// 账本索引默认写在 ~/.llms-bridge/,跑测试不该碰用户真实目录(journal.ts 惰性读这个变量)。
+process.env.LLMS_BRIDGE_HOME = join(tmpdir(), `llms-bridge-test-home-${process.pid}`);
 
 const adapters = createAdapters();
 
@@ -138,6 +143,63 @@ const ACP_INIT_OK = JSON.stringify({
   },
 });
 
+test('opencode 的报错事件必须转达原话,不许只剩"退出码 1 且无文本"', () => {
+  // 实测(2026-09-24):`opencode/` 通道 key 无效时,它把 401 以 type:"error" 事件发在 **stdout** 上,
+  // stderr 是空的。解析器当初不认这个类型 → 调用方只拿到一句无信息量的"退出码 1 且无文本",
+  // 一条已经说清原因的失败白排查了很久。这条钉的就是"对方说了话就一定要转达"。
+  const opencode = adapters.find((a) => a.id === 'opencode');
+  const run = opencode.createRun(
+    {
+      taskId: 't',
+      harness: 'opencode',
+      prompt: 'x',
+      cwd: process.cwd(),
+      approval: 'read-only',
+      budget: { maxWallMs: 1000 },
+      session: { mode: 'fresh' },
+    },
+    't',
+  );
+
+  const line = JSON.stringify({
+    type: 'error',
+    error: {
+      name: 'APIError',
+      data: { message: 'Invalid API key.', statusCode: 401, responseHeaders: { 'cf-ray': 'abc' } },
+    },
+  });
+  const events = run.parseLine(line);
+  const err = events.find((e) => e.type === 'error');
+  assert.ok(err, 'type:"error" 必须变成 error 事件');
+  assert.match(err.text, /Invalid API key\./);
+  assert.match(err.text, /HTTP 401/, '状态码要带上,调用方据此判断是鉴权还是限流');
+
+  const fin = run.finalize(1);
+  assert.match(fin.errorText ?? '', /Invalid API key\./, '终态原因要用对方的原话,不是我们编的通用句子');
+  assert.equal(fin.text, undefined);
+});
+
+test('opencode 有正文时不算失败(错误可能只是一次失败重试)', () => {
+  const opencode = adapters.find((a) => a.id === 'opencode');
+  const run = opencode.createRun(
+    {
+      taskId: 't',
+      harness: 'opencode',
+      prompt: 'x',
+      cwd: process.cwd(),
+      approval: 'read-only',
+      budget: { maxWallMs: 1000 },
+      session: { mode: 'fresh' },
+    },
+    't',
+  );
+  run.parseLine(JSON.stringify({ type: 'error', error: { data: { message: 'rate limited', statusCode: 429 } } }));
+  run.parseLine(JSON.stringify({ type: 'text', part: { text: 'FINAL ANSWER' } }));
+  const fin = run.finalize(0);
+  assert.equal(fin.errorText, undefined, '已经有交付正文了,不该因为中间一次错误就判失败');
+  assert.equal(fin.text, 'FINAL ANSWER');
+});
+
 test('层级① 对不支持的 spec 选项必须显式报错,不许静默忽略', () => {
   const acp = adapters.find((a) => a.tier === 1);
   assert.ok(acp, '注册表里应有层级① 的 adapter');
@@ -151,7 +213,6 @@ test('层级① 对不支持的 spec 选项必须显式报错,不许静默忽略
       approval: 'read-only',
       budget: { maxWallMs: 1000 },
       session: { mode: 'resume', sessionId: 'abc' },
-      model: 'some-model-x',
       outputSchemaPath: 'C:/tmp/schema.json',
     },
     't',
@@ -160,14 +221,37 @@ test('层级① 对不支持的 spec 选项必须显式报错,不许静默忽略
   const events = run.parseLine(ACP_INIT_OK);
   const texts = events.map((e) => e.text ?? '').join('\n');
 
-  assert.match(texts, /model=some-model-x/, '应报出 model 被忽略');
   assert.match(texts, /session\.mode=resume/, '应报出 session 被忽略');
   assert.match(texts, /output_schema=/, '应报出 output_schema 被忽略');
   assert.ok(
-    events.filter((e) => e.type === 'error').length >= 3,
-    `三项都应以 error 事件呈现,实际 ${JSON.stringify(events)}`,
+    events.filter((e) => e.type === 'error').length >= 2,
+    `两项都应以 error 事件呈现,实际 ${JSON.stringify(events)}`,
   );
   assert.ok(events.some((e) => e.type === 'status'), '仍应有连接成功事件');
+});
+
+test('层级① 的 model 已不再是"被忽略的选项"(它真的会发 set_model)', () => {
+  // 这条此前断言 model 出现在"已被忽略"里;2026-09-23 `session/set_model` 实测接通后反了过来。
+  // 派发时点名模型是刚需(用户按模型名派活),静默忽略会让调用方以为指定生效了 ——
+  // 所以该选项的验收搬到了 test/acp-model.test.mjs,这里只钉"不再报忽略"。
+  const acp = adapters.find((a) => a.tier === 1);
+  const run = acp.createRun(
+    {
+      taskId: 't',
+      harness: acp.id,
+      prompt: 'x',
+      cwd: process.cwd(),
+      approval: 'read-only',
+      budget: { maxWallMs: 1000 },
+      session: { mode: 'fresh' },
+      model: 'some-model-x',
+    },
+    't',
+  );
+
+  const events = run.parseLine(ACP_INIT_OK);
+  const texts = events.map((e) => e.text ?? '').join('\n');
+  assert.doesNotMatch(texts, /model=some-model-x.*忽略/, 'model 已接通,不该再报"被忽略"');
 });
 
 test('层级① 未传这些选项时不该产生噪音', () => {

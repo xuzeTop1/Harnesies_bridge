@@ -26,6 +26,9 @@ import { createAdapters } from '../src/registry.ts';
 
 const live = process.env.LLMS_BRIDGE_LIVE === '1';
 
+// 账本索引默认写在 ~/.llms-bridge/,跑测试不该碰用户真实目录(journal.ts 惰性读这个变量)。
+process.env.LLMS_BRIDGE_HOME = join(tmpdir(), `llms-bridge-test-home-${process.pid}`);
+
 const git = (cwd, args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
 
 async function makeBuggyRepo() {
