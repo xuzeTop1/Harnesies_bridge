@@ -3,9 +3,13 @@ import { locateTaskRecord, recordDispatch, recordFinish, taskRecordPath } from '
 import type { TaskRecord } from './journal.ts';
 import { checkCloudPolicy, readCloudPolicy } from './policy.ts';
 import { redactCredentials } from './redact.ts';
+import { auditDisk, snapshotDisk } from './audit.ts';
+import type { DiskSnapshot } from './audit.ts';
+import { enforcementNote, enforcementOf } from './enforcement.ts';
 import { allocateWorktree, captureDiff, isGitRepo, resolveReusableWorktree } from './worktree.ts';
 import type {
   Adapter,
+  ApprovalEnforcement,
   ApprovalLevel,
   BridgeEvent,
   EgressReport,
@@ -24,6 +28,13 @@ const LEVELS: readonly ApprovalLevel[] = ['read-only', 'workspace-write', 'full'
 // 可覆盖是为了让"截断"这条安全分支真的能被测到 —— 否则用例得先造一份 200KB 的 diff。
 const DIFF_CAP = Number(process.env.LLMS_BRIDGE_DIFF_CAP ?? 200_000);
 
+/** 只对声明支持的档位给结论;没实测过的由 enforcementOf() 落成 'unknown',不默认成拦得住。 */
+function enforcementMap(adapter: Adapter): Partial<Record<ApprovalLevel, ApprovalEnforcement>> {
+  const out: Partial<Record<ApprovalLevel, ApprovalEnforcement>> = {};
+  for (const level of adapter.supportedApprovals) out[level] = enforcementOf(adapter, level);
+  return out;
+}
+
 interface TaskState {
   /** 调用方给的原始 spec(并发判定用原始 cwd)。 */
   spec: TaskSpec;
@@ -37,6 +48,8 @@ interface TaskState {
   result?: TaskResult;
   isolated: boolean;
   worktreePath?: string;
+  /** 派发前对**调用方原始 cwd** 拍的快照;审计要拿它当基线。 */
+  diskBefore?: DiskSnapshot;
 }
 
 export interface DispatchAck {
@@ -44,6 +57,12 @@ export interface DispatchAck {
   /** 是否分配了独立 worktree。 */
   isolated: boolean;
   worktreePath?: string;
+  /**
+   * 这次用的档位实际拦不拦得住。放在 ack 是刻意的:调用方在**派发那一刻**就该知道
+   * 自己买到了什么,而不是等结果出来才发现"只读"是个标签。
+   */
+  approvalEnforcement: ApprovalEnforcement;
+  approvalNote: string;
   /**
    * 这次派发的数据去向(adapter 自报;它不知道就留空,调度器绝不替它编)。
    * 放在 ack 而不是只放 harness_list,是因为用户会在两次派发之间用 cc-switch 换端点 ——
@@ -57,6 +76,11 @@ export interface HarnessInfo {
   tier: Tier;
   displayName: string;
   supportedApprovals: readonly ApprovalLevel[];
+  /**
+   * 逐档位的"拦不拦得住"。必须和 supportedApprovals 一起给:只显示后者会让调用方
+   * 把"桥肯给这个档"读成"这家不会改我的盘",而实测这两件事在 opencode 上并不等价。
+   */
+  approvalEnforcement: Partial<Record<ApprovalLevel, ApprovalEnforcement>>;
 }
 
 export type HarnessReport = HarnessInfo & {
@@ -118,6 +142,7 @@ export class Scheduler {
       tier: a.tier,
       displayName: a.displayName,
       supportedApprovals: a.supportedApprovals,
+      approvalEnforcement: enforcementMap(a),
     }));
   }
 
@@ -146,6 +171,7 @@ export class Scheduler {
           tier: a.tier,
           displayName: a.displayName,
           supportedApprovals: a.supportedApprovals,
+          approvalEnforcement: enforcementMap(a),
           available: d.available,
           version: d.version,
           detail: d.detail,
@@ -275,6 +301,11 @@ export class Scheduler {
     // plan() 会在此处抛出(二进制未探测到等),让派发失败在调用方当场可见。
     const plan = adapter.plan(runSpec);
 
+    // 基线紧贴启动取:早一步(比如在 detectAll 之前)就多几秒窗口,用户在别的窗口里
+    // 改的文件会被算到 worker 头上;晚一步就漏掉 worker 最初的写入。
+    // 拍的是 spec.cwd(**调用方给的那个目录**),不是被换成的 worktree —— 要抓的正是越界。
+    const diskBefore = await snapshotDisk(spec.cwd);
+
     const state: TaskState = {
       spec,
       runSpec,
@@ -285,11 +316,14 @@ export class Scheduler {
       finished: false,
       isolated,
       worktreePath,
+      diskBefore,
     };
     this.#tasks.set(spec.taskId, state);
     // 账本写在启动**之前**:启动后进程随时可能被杀,那就什么痕迹都没有了。
     recordDispatch(runSpec, effectiveCwd, adapter.tier, isolated, egress?.endpointHost);
     this.#running.set(spec.taskId, this.#execute(adapter, runSpec, state, plan));
+
+    const approvalEnforcement = enforcementOf(adapter, spec.approval);
 
     // 端点可以在两次派发之间被用户整体换掉(cc-switch),所以 ack 里的出口**现取**,
     // 不复用 detectAll 的缓存。取不到就不报,宁缺毋滥。
@@ -297,6 +331,8 @@ export class Scheduler {
       taskId: spec.taskId,
       isolated,
       worktreePath,
+      approvalEnforcement,
+      approvalNote: enforcementNote(spec.approval, approvalEnforcement),
       egress: egress ? { ...egress, promptBytes: Buffer.byteLength(spec.prompt, 'utf8') } : undefined,
     };
   }
@@ -430,6 +466,34 @@ export class Scheduler {
       });
     }
 
+    // 先钉住结束时刻:审计要再跑一次 git,不该把"worker 何时结束"往后推。
+    const endedAt = Date.now();
+
+    // 审计的对象是 state.spec.cwd —— **调用方给的目录**,不是 runSpec 那个被换成的 worktree。
+    // 写档即使隔离了也要审原目录:要抓的就是"越界写到你的主仓库"那种事。
+    const diskAudit = await auditDisk(
+      state.spec.cwd,
+      state.diskBefore ?? { repo: false, whyNot: '桥没取到派发前快照' },
+    );
+
+    // 什么算越界:
+    //  - 只读档:改了这个目录里的任何东西就是违约(档位可能只是标签,所以要用事实说话);
+    //  - 写档且已隔离:worker 的写应该全在 worktree 里,主目录动了说明它跑出去了;
+    //  - 写档且调用方主动放弃隔离(allowUnisolatedWrite):改 cwd 是它要的行为,不算越界。
+    const escaped =
+      diskAudit.audited === true &&
+      diskAudit.changed === true &&
+      (spec.approval === 'read-only' || state.isolated);
+    if (escaped) {
+      const where = diskAudit.headMoved ? '含 HEAD 移动(在你仓库里提交了)' : `${diskAudit.paths?.length ?? 0} 处文件`;
+      // 与"超预算"同构:产出可能是好的,但契约破了,所以判 failed 并说清为什么。
+      // 不许让它停在 ok 上 —— 只查 status 的调用方(实测确实有这种)会整个漏掉这件事。
+      status = 'failed';
+      reason = `越界改动:审批档位=${spec.approval} 隔离=${state.isolated},但 ${state.spec.cwd} 被改动了 ${where}`;
+    }
+
+    const approvalEnforcement = enforcementOf(adapter, spec.approval);
+
     state.result = {
       taskId: spec.taskId,
       harness: adapter.id,
@@ -440,9 +504,12 @@ export class Scheduler {
       usage: fin.usage,
       eventCount: state.events.length,
       startedAt: state.startedAt,
-      endedAt: Date.now(),
+      endedAt,
       reason,
       isolated: state.isolated,
+      approvalEnforcement,
+      approvalNote: enforcementNote(spec.approval, approvalEnforcement),
+      diskAudit,
       model: spec.model,
       worktreePath: state.worktreePath,
       diff: capturedDiff,

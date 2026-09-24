@@ -21,6 +21,7 @@
 import { createInterface } from 'node:readline';
 import { Scheduler } from './scheduler.ts';
 import { createAdapters } from './registry.ts';
+import { enforcementNote } from './enforcement.ts';
 import type { ApprovalLevel, SessionMode, TaskSpec } from './types.ts';
 import { DispatchRejected } from './types.ts';
 
@@ -44,7 +45,10 @@ const TOOLS = [
   {
     name: 'harness_list',
     description:
-      '列出本机可用的 agent harness:层级(1=ACP会话协议 2=双向流 3=一次性子进程)、支持的审批档位、当前可用性与版本。派发前先用它选人。',
+      '列出本机可用的 agent harness:层级(1=ACP会话协议 2=双向流 3=一次性子进程)、支持的审批档位、当前可用性与版本。派发前先用它选人。' +
+      '**必须连同 `approvalEnforcement` 一起读**:它说明每一档究竟拦不拦得住那个 harness 写盘 —— ' +
+      '`advisory` 表示那只是个标签(实测它照样改你的磁盘),`unknown` 表示桥没实测过。' +
+      '两者都不能当沙箱用;想要确定性,靠提示词加结果里的 diskAudit。',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
@@ -73,7 +77,10 @@ const TOOLS = [
         approval: {
           type: 'string',
           enum: ['read-only', 'workspace-write', 'full'],
-          description: '审批档位,必填无默认。full 会让该模型在无人确认下改动磁盘',
+          description:
+            '审批档位,必填无默认。full 会让该模型在无人确认下改动磁盘。' +
+            "**注意**:这个档位能不能真的拦住写入,取决于那一家 —— 看 harness_list 的 approvalEnforcement," +
+            'advisory/unknown 都别当沙箱用',
         },
         max_wall_ms: { type: 'integer', description: '墙钟上限(毫秒),必填。超时即中断进程树' },
         max_tokens: { type: 'integer', description: '可选 token 上限,超限即中断并标 failed' },
@@ -164,6 +171,11 @@ async function callTool(name: string, args: Record<string, unknown>) {
           displayName: r.displayName,
           tier: r.tier,
           supportedApprovals: r.supportedApprovals,
+          // 与档位同一份输出:只给 supportedApprovals 会让调用方以为列出来的档都拦得住。
+          approvalEnforcement: r.approvalEnforcement,
+          approvalNotes: Object.fromEntries(
+            Object.entries(r.approvalEnforcement).map(([lvl, e]) => [lvl, enforcementNote(lvl as ApprovalLevel, e!)]),
+          ),
           available: r.available,
           version: r.version,
           note: r.detail,
@@ -209,6 +221,9 @@ async function callTool(name: string, args: Record<string, unknown>) {
         model: spec.model,
         isolated: ack.isolated,
         worktree: ack.worktreePath,
+        // 派发那一刻就说清这个档位在**这家**拦不拦得住,不等结果。
+        approval_enforcement: ack.approvalEnforcement,
+        approval_note: ack.approvalNote,
         // 每次派发现场重算:让用户在派发后就看见"这批数据到底发去了哪",
         // 而不是去翻可能已过期的 harness_list。该 harness 不自报时整个字段缺失。
         egress: ack.egress

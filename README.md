@@ -73,6 +73,10 @@ npm run dispatch      # 命令行派发一次(调试用;正常入口是 MCP)
   "harness": "codex",
   "isolated": true,
   "worktree": "…/.llms-bridge/worktrees/1007571f70624d6d",
+  // 这个档位在**这一家**到底拦不拦得住:enforced / advisory / unknown(缺省)。
+  // advisory = 桥实测过它不会因此收手;unknown = 桥没实测过。两者都不能当沙箱用。
+  "approval_enforcement": "unknown",
+  "approval_note": "桥没有实测过这家在 approval='read-only' 下会不会真的收手,按\"不确定\"对待。…",
   "egress": {
     "endpoint_host": "api.anthropic.com",
     "native_anthropic": true,
@@ -93,6 +97,35 @@ worktree 的形态由调用方显式选(默认永远是"新建 + 隔离"):
 | 都不给 | 在 `cwd` 的仓库里新建 `--detach` worktree | `isolated: true` + `worktree_path` |
 | `reuse_worktree_path` | 复用已有 worktree(仅写档;先验"同仓库且非主工作区") | `isolated: true` |
 | `allow_unisolated_write: true` | 直接写 `cwd`(git 仓库里也生效) | `isolated: false` |
+
+### 档位拦不住时,用事实兜底
+
+`approval` 是**意图**,不是结果。opencode 的 `read-only` 就实测过不拦:照样执行命令、
+照样往 cwd 外写文件。所以桥在派发前后,会对**你给的那个 cwd** 各取一次 `git status` 与 HEAD
+来比对,结果放进 `harness_result` 的 `diskAudit`:
+
+```jsonc
+{
+  "status": "failed",           // 只读档改了盘 → 判 failed,不会停在 ok
+  "reason": "越界改动:审批档位=read-only 隔离=false,但 D:/some/git/repo 被改动了 1 处文件",
+  "diskAudit": {
+    "audited": true,
+    "cwd": "D:/some/git/repo",
+    "changed": true,
+    "paths": [{ "path": "notes/probe.txt", "before": "", "after": "??" }],
+    "headMoved": false,
+    "caveats": ["盲区1:被 .gitignore 排除的路径 git 不会报…", "盲区2:只审计这一个目录…", "…"]
+  }
+}
+```
+
+三条要说清:
+
+- `audited: false`(**非 git 目录**)不等于 `changed: false`,更不等于"它没改动" —— 那是"没法验证"。
+- 已隔离的写任务同样审计原目录:要抓的就是"跑出去动主仓库"。而 `allow_unisolated_write`
+  下写 `cwd` 是你要的行为,不判越界(但 `changed` 照样如实报)。
+- 审计**只报告,不回滚**。它也不覆盖 `.gitignore` 里的路径和仓库外的绝对路径写入 —— 盲区在
+  `caveats` 里随结果一起带出,不藏。
 
 仓库级"数据能不能出本机"写在 `<仓库>/.llms-bridge/policy.json`(**文件不存在＝不限制**):
 
@@ -125,12 +158,17 @@ ACP 的探测超时算"未判定"而不是"不可用"——会重试一次更宽
 1. **凭证**:桥不读、不存、不转发任何云端厂商密钥,无例外。只复用各家 CLI 自己的登录态。
    唯一例外是宿主自己写在配置里的 **localhost 服务 token**,按字段白名单就地只读使用(见 AGENTS.md §1.1)。
 2. **审批**:见上,必填无默认;绕过类档位必须用户当次点名。
+   档位还分"拦不拦得住":每个档位随 `supportedApprovals` 一起给 `approvalEnforcement` ——
+   `enforced`(实测拦住)/ `advisory`(实测**不**拦,如 opencode 的 read-only)/ `unknown`(没实测过)。
+   **缺省是 `unknown`,不会替你假设拦住。**`harness_list`、派发 ack、结果三处都能看到。
 3. **隔离**:可能改盘的 worker 一律分到独立 git worktree(`--detach`),源工作区不动。
    默认永远是"新建 + 隔离";`reuse_worktree_path`(复用已有 worktree,仅写档)与
    `allow_unisolated_write`(直接写 cwd,**git 仓库里也生效**)都必须显式传,且放弃隔离时
    结果/ack/账本三处都标 `isolated: false`。非 git 目录下的写任务默认拒绝。
-   产物以 diff 回收,**不自动合并**。容器目录 `.llms-bridge/` 与 `.scratch/`
-   都在 `.gitignore` 里;清理 worktree 默认是 dry-run,要 `confirm` 才删,且只删桥自己创建的。
+   产物以 diff 回收,**不自动合并**。容器目录 `.llms-bridge/` 写进仓库**本地**的
+   `.git/info/exclude`(不动版本化的 `.gitignore`,不为"桥跑过一次"污染你的 diff);
+   `.scratch/` 是另一回事。清理 worktree 默认是 dry-run,要 `confirm` 才删,且只删桥自己创建的。
+   隔离只保证默认落点,**越界由事后审计抓**:见上一节 `diskAudit`。
    仓库级"数据能否出本机"另有一道:见上方 `policy.json`。
 4. **预算**:`max_wall_ms` 到点中断整棵进程树并标 `timeout`;超限不许偷偷换更贵的模型续跑。
 
@@ -157,6 +195,9 @@ src/
   types.ts        统一模型:TaskSpec / Adapter / BridgeEvent / 四道闸门的类型约束
   scheduler.ts    派发、并发、预算、隔离、事件累积与终态不变量
   worktree.ts     写任务的 git worktree 隔离、复用校验与 diff 回收
+  audit.ts        事后磁盘审计:派发前后比对调用方 cwd,抓越界写(只报告,不回滚)
+  enforcement.ts  档位的"拦不拦得住"语义:enforced / advisory / unknown,缺省 unknown
+  redact.ts       事件出口按字段名隐去凭证值(按值形态判断会误伤预算要用的 token 计数)
   journal.ts      任务账本:进程消失后仍能回答"派发过什么、最后怎样、产出了什么"
   policy.ts       仓库级云策略(数据能不能出本机)
   egress.ts       数据去向自报(端点主机、是否原生、代理线索)

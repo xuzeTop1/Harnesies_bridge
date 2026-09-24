@@ -15,7 +15,8 @@ import { createAcpAdapter } from './adapters/acp.ts';
  * "This client is no longer supported for Gemini Code Assist for individuals" 拒绝(见 PLAN §3.6)。
  *
  * opencode 单列一个层级③ 适配器,不走 mimo 那条 ACP:mimo 虽是 OpenCode 的套壳,
- * 但 `opencode run` 有 `--format json` 与 443 个自报模型,比 ACP 路径好接且模型面宽得多。
+ * 但 `opencode run` 有 `--format json`,且它自报的模型清单比 mimo 宽一个量级,
+ * 比 ACP 路径好接。（条数不写在这里 —— 那是会漂移的即时值，问 harness_models 要。）
  */
 export function createAdapters(): Adapter[] {
   return [

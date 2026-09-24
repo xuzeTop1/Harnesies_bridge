@@ -39,8 +39,16 @@ export function createOpencodeAdapter(): Adapter {
   return {
     id: 'opencode',
     tier: 3,
-    displayName: 'OpenCode CLI(443 模型/7 提供商)',
+    // 不往名字里塞模型条数:那是对方目录的即时值,一天内就从 443 涨到 544。
+    // 条数与核查时间由 harness_models 给,写死在这里就是让它去过期。
+    displayName: 'OpenCode CLI(模型面最宽;清单见 harness_models)',
     supportedApprovals: ['read-only'],
+    /**
+     * 实测结论(2026-09-23 R7 探针,以及事后复核):给 read-only 档时它照样执行命令、
+     * 照样往 cwd 外写文件、照样按绝对路径读源仓库。也就是说这一家唯一能派的档位**不约束写**。
+     * 标 advisory 而不是把档位摘掉:摘掉等于说"没有只读档可用",而真实情况是"这个标签不解决问题"。
+     */
+    approvalEnforcement: { 'read-only': 'advisory' },
 
     async detect(): Promise<DetectResult> {
       entry = await resolveGlobalCli('opencode', 'opencode-ai');

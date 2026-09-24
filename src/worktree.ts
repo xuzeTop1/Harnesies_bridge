@@ -10,7 +10,7 @@ const WORKTREE_DIRNAME = '.llms-bridge';
 const WORKTREE_SUBDIR = 'worktrees';
 const EXCLUDE_ENTRY = `${WORKTREE_DIRNAME}/`;
 
-async function git(cwd: string, args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+export async function git(cwd: string, args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   try {
     const { stdout, stderr } = await execFileAsync('git', ['-C', cwd, ...args], {
       timeout: 60_000,

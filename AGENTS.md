@@ -45,6 +45,10 @@ WorkBuddy / Qwen / 其它接入的 worker),以及人。
 - 常规档位用**最小够用**:Codex `-s workspace-write`、Gemini/Qwen `--approval-mode auto-edit`、
   Claude 常规 permission mode。
 - worker 的写权限**限制在自己的 worktree 内**,不允许写到仓库外或系统目录。
+- **档位标签不等于约束力**。`supportedApprovals` 只回答"桥肯不该给这一档",不回答"那一家会不会收手"。
+  每个档位必须标 `enforced`(桥实测过真的拦住)/ `advisory`(桥实测过**不**拦住)/ `unknown`(没实测过),
+  **缺省值是 `unknown`,不许默认成拦住**——把"我不知道"当"安全"是本项目最忌的静默降级。
+  已实测为 `advisory` 的:opencode 的 `read-only`(照样执行命令、写 cwd 外、按绝对路径读源仓库)。
 - 给用户的提示语里,若涉及绕过审批,必须明说"这将让 XX 模型在无人确认下改动你的磁盘"。
 
 ### 3. 隔离:并行 worker 一个 worktree
@@ -52,6 +56,14 @@ WorkBuddy / Qwen / 其它接入的 worker),以及人。
 - 任何可能改动文件的 worker,必须先分配独立 git worktree,不允许两个 worker 共享工作目录。
 - **已实现**(`src/worktree.ts`):写任务在 git 仓库下自动分配 `--detach` worktree,
   worker 的 cwd 被换成它,**源仓库不动**。
+- **worktree 只保证"默认落点",不保证"不出界"**(绝对路径照样能写出去),所以要配**事后审计**
+  (已实现,`src/audit.ts`):派发前后对**调用方原始 cwd** 各取一次 `git status` 与 HEAD 比对。
+  只读档改了盘、或已隔离的写档动了主仓库 ⇒ 判 `failed` 并说明越界 —— **不许停在 `status=ok`**,
+  因为实测确有调用方只看 status。反向也一样:非 git 目录要如实报 `audited:false`,
+  那**不等于** `changed:false`,更不等于"没改动"。
+  固有盲区必须随结果一起带出去:`.gitignore` 排除的路径 git 不报、仓库外的绝对路径写入不在范围内、
+  "它读了什么/发给了谁"归 §3.1 与 egress 管不在这里。
+  另:审计只报告,**不擅自回滚用户的盘**。
 - **默认永远是"新建 + 隔离"**;三种形态由调用方显式选(2026-09-24 经用户确认放开):
   `reuseWorktreePath`(复用已有 worktree,仅写档;桥会先验"同仓库且非主工作区")、
   `allowUnisolatedWrite: true`(直接写 cwd,**git 仓库里也生效**)、什么都不给(新建 worktree)。

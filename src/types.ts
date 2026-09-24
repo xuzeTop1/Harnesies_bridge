@@ -1,3 +1,5 @@
+import type { DiskAudit } from './audit.ts';
+
 /**
  * 统一任务模型与事件模型。
  *
@@ -12,6 +14,14 @@ export type Tier = 1 | 2 | 3 | 4 | 5;
  * 必须由调用方在任务里显式声明 allowedFull 才放行 —— 见 AGENTS.md 铁律二。
  */
 export type ApprovalLevel = 'read-only' | 'workspace-write' | 'full';
+
+/**
+ * 该档位到底是"桥拦住了"还是"只是个标签"。
+ *
+ * `unknown` 是**默认值**,不是占位:桥没实测过的档位不许宣称拦得住 ——
+ * 把"我不知道"当"安全"是本项目最忌的静默降级(同云策略里"端点未知按不可信处理")。
+ */
+export type ApprovalEnforcement = 'enforced' | 'advisory' | 'unknown';
 
 export interface Budget {
   /** 墙钟上限(毫秒)。超时即中断进程,结果标 timeout。 */
@@ -120,6 +130,18 @@ export interface TaskResult {
   reason?: string;
   /** 是否给该 worker 分配了独立 worktree。 */
   isolated: boolean;
+  /**
+   * 这次用的审批档位**实际**拦不拦得住。'unknown' 是诚实的答案,不是缺数据。
+   * 与 `isolated` 一样:宁可说"没保证",不许过度宣称。
+   */
+  approvalEnforcement?: ApprovalEnforcement;
+  approvalNote?: string;
+  /**
+   * 派发前后对**调用方原始 cwd**做的磁盘比对。
+   * 写档即使隔离在 worktree 里也会审计原目录 —— 要抓的正是"越界写到你的主仓库"。
+   * `audited:false` 表示没审计成(通常是非 git 目录),那不等于"没改动"。
+   */
+  diskAudit?: DiskAudit;
   /** 指定的模型(没指定则为 undefined,即该 harness 的默认模型)。 */
   model?: string;
   /** 隔离时 worker 实际的工作目录;改动保留在这里,未合并回源仓库。 */
@@ -195,6 +217,15 @@ export interface Adapter {
   displayName: string;
   /** 该 adapter 支持到哪几档审批。full 是否真放行由调度器按 allowedFull 决定。 */
   supportedApprovals: readonly ApprovalLevel[];
+  /**
+   * `supportedApprovals` 里哪些档位**真的拦得住**该 harness 写盘/执行命令。
+   * 只允许出现桥自己实测过的结论;没列出来的档位由 enforcementOf() 判成 'unknown'。
+   *
+   * 为什么单列一个字段而不是直接把档位从 supportedApprovals 里删掉:删掉等于说"这家没有只读档",
+   * 而事实是"这个标签不解决问题"——两者对调用方的决策含义不同。opencode 只有 read-only 可派,
+   * 摘掉它就直接不可用了;如实标 advisory 才能让调用方**带着这个认知**去派。
+   */
+  approvalEnforcement?: Partial<Record<ApprovalLevel, 'enforced' | 'advisory'>>;
   detect(): Promise<DetectResult>;
   plan(spec: TaskSpec): SpawnPlan;
   createRun(spec: TaskSpec, taskId: string): RunParser;
