@@ -49,6 +49,12 @@ const USAGE = `llms-bridge(冒烟入口)
       只清理本桥创建的(.llms-bridge/worktrees/ 下),不动其它 worktree。
       **worker 的 diff 未合并前不要删。**
 
+  node src/cli.ts ui [--port <n>]
+      起一个**只读**观测面板(任务进度、分发情况、各家 token 用量)。
+      只听 127.0.0.1,端口默认交给系统分配;实际地址打到本命令的 stdout,
+      并写进 ~/.llms-bridge/ui.json 供事后找回。Ctrl-C 退出。
+      它没有任何派发/取消接口 —— 控制面仍然只有 MCP 那六个原语。
+
   approval 取值: read-only | workspace-write | full(full 需 --allow-full)`;
 
 async function main(): Promise<number> {
@@ -99,6 +105,19 @@ async function main(): Promise<number> {
       for (const p of result.targets) console.log(`  ${p}`);
       console.log('确认 diff 已回收/已合并后再加 --confirm 真删。');
     }
+    return 0;
+  }
+
+  if (command === 'ui') {
+    const { startUi } = await import('./ui.ts');
+    const handle = await startUi({ port: num(flags, 'port') ?? 0 });
+    console.log(`[ui] 只读面板已起在 ${handle.url}`);
+    console.log(`[ui] 端口是临时分配的,登记在 ${handle.registryPath}`);
+    console.log('[ui] Ctrl-C 退出。面板不派发任务,只读账本。');
+    // 挂住不退:等信号。SIGINT 走默认行为即可,这里只需别让事件循环提前空掉。
+    await new Promise<void>((resolve) => {
+      process.once('SIGINT', () => void handle.close().then(resolve));
+    });
     return 0;
   }
 

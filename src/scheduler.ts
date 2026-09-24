@@ -1,6 +1,15 @@
 import { runStreaming } from './proc.ts';
-import { locateTaskRecord, recordDispatch, recordFinish, taskRecordPath } from './journal.ts';
-import type { TaskRecord } from './journal.ts';
+import {
+  judgeLiveness,
+  locateTaskRecord,
+  readTaskBeat,
+  recordDispatch,
+  recordFinish,
+  readProgress,
+  startHeartbeat,
+  taskRecordPath,
+} from './journal.ts';
+import type { TaskProgress, TaskRecord } from './journal.ts';
 import { checkCloudPolicy, readCloudPolicy } from './policy.ts';
 import { redactCredentials } from './redact.ts';
 import { auditDisk, snapshotDisk } from './audit.ts';
@@ -50,6 +59,8 @@ interface TaskState {
   worktreePath?: string;
   /** 派发前对**调用方原始 cwd** 拍的快照;审计要拿它当基线。 */
   diskBefore?: DiskSnapshot;
+  /** 关掉这个任务的心跳定时器。#execute 抛异常时也必须关,见 dispatch 里的 finally。 */
+  stopBeat?: () => void;
 }
 
 export interface DispatchAck {
@@ -108,6 +119,11 @@ export interface TaskSnapshot {
   fromJournal?: boolean;
   reason?: string;
   journalPath?: string;
+  /**
+   * 进度与判活。注意 `liveness:'heartbeat_lost'` 时**不许**按"在跑"渲染 ——
+   * 记录本身会永远停在 running(进程被杀就是这样的),只有心跳能把它和真在跑的分开。
+   */
+  progress?: TaskProgress;
 }
 
 /**
@@ -321,7 +337,12 @@ export class Scheduler {
     this.#tasks.set(spec.taskId, state);
     // 账本写在启动**之前**:启动后进程随时可能被杀,那就什么痕迹都没有了。
     recordDispatch(runSpec, effectiveCwd, adapter.tier, isolated, egress?.endpointHost);
-    this.#running.set(spec.taskId, this.#execute(adapter, runSpec, state, plan));
+    // 心跳定时器挂在这条链上停:正常收尾、超时、还是 #execute 抛异常,三条路都必须停。
+    // 漏停会让一个早已结束的任务继续跳心跳 —— "永远显示在跑"是面板能给的最坏的假信号。
+    this.#running.set(
+      spec.taskId,
+      this.#execute(adapter, runSpec, state, plan).finally(() => state.stopBeat?.()),
+    );
 
     const approvalEnforcement = enforcementOf(adapter, spec.approval);
 
@@ -346,6 +367,20 @@ export class Scheduler {
     const parser = adapter.createRun(spec, spec.taskId);
     let tokens = 0;
     let overBudget = false;
+
+    // 心跳:让"这个任务还在被看着"这件事有落盘证据,面板才谈得上进度。
+    // 交给 dispatch 那边的 finally 统一停 —— 放在这里 stop 会漏掉抛异常那条路。
+    const beat = startHeartbeat(spec.cwd, spec.taskId, () => {
+      const last = state.events[state.events.length - 1];
+      return {
+        events: state.events.length,
+        lastSeq: last?.seq,
+        lastType: last?.type,
+        lastEventAt: last?.at,
+        tokens,
+      };
+    });
+    state.stopBeat = () => beat.stop();
 
     const outcome = await runStreaming({
       command: plan.command,
@@ -549,6 +584,8 @@ export class Scheduler {
           fromJournal: true,
           reason: note.reason,
           journalPath: note.journalPath,
+          // 走账本时进度只能来自心跳文件 —— 它同时也是"桥还活着吗"的唯一证据。
+          progress: readProgress(cwd, taskId, record),
         };
       }
       throw new DispatchRejected(
@@ -570,6 +607,18 @@ export class Scheduler {
         : undefined,
       isolated: state.isolated,
       worktreePath: state.worktreePath,
+      // 内存路径也走同一套判据:计数取即时的,判活仍用心跳文件 —— 否则面板和 poll 会各说一套。
+      progress: readProgress(
+        state.runSpec.cwd,
+        taskId,
+        { status: state.finished ? (state.result?.status ?? 'ok') : 'running', startedAt: state.startedAt },
+        {
+          events: state.events.length,
+          tokens: usage ? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0) : 0,
+          lastType: last?.type,
+          lastEventAt: last?.at,
+        },
+      ),
     };
   }
 

@@ -8,6 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { redactCredentials } from '../src/redact.ts';
@@ -91,16 +92,20 @@ test('调度器接线:事件流里的 raw 必须已隐去,而主脑仍能看到�
   };
 
   const scheduler = new Scheduler([stub]);
+  // 用临时目录当 cwd:账本记录与心跳是**按任务 cwd**落的,拿 process.cwd() 会把测试垃圾
+  // 直接写进本仓库的 .llms-bridge/tasks/ —— 光重定向 LLMS_BRIDGE_HOME 只挡住了索引,挡不住这个。
+  const cwd = await mkdtemp(join(tmpdir(), 'llms-bridge-redact-'));
   const ack = await scheduler.dispatch({
     taskId: 'leak-1',
     harness: 'stub-leak',
     prompt: 'x',
-    cwd: process.cwd(),
+    cwd,
     approval: 'read-only',
     budget: { maxWallMs: 30_000 },
     session: { mode: 'fresh' },
   });
   await scheduler.collect(ack.taskId);
+  await rm(cwd, { recursive: true, force: true });
 
   const events = scheduler.events('leak-1');
   assert.equal(
