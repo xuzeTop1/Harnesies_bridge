@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "跨厂商 harness 协同桥:把子任务派发给本机其它厂商的 agent harness 并收回结构化结果",
+  "description": "Multi-harness orchestration bridge for Codex, Claude Code, OpenCode, Qwen and more, with isolation, auditing, approvals and unified task execution.",
   "engines": {
     "node": ">=23.6"
   },
