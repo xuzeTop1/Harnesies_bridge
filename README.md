@@ -1,4 +1,4 @@
-# LLMS_Bridge
+# llms-bridge
 
 让**你此刻正在用的那个 agent harness** 当主脑,把子任务派发给本机其它厂商的 harness
 (Codex / Claude Code / CodeBuddy / OpenCode / Qwen / MiMo / OpenClaw …)去跑,再把过程与
