@@ -6,6 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createAdapters } from '../src/registry.ts';
@@ -316,7 +317,7 @@ test('调度器真的会拒绝层级① 的写任务', async () => {
 
 // —— CodeBuddy(腾讯,层级②)—— 本机第二个真正能产出文本的 harness ——
 
-test('codebuddy 已入列,且必须解析到 WorkBuddy 捆绑的那份 CLI', async () => {
+test('codebuddy 已入列,未给覆盖时默认解析到 WorkBuddy 捆绑的那份 CLI', async () => {
   const cb = adapters.find((a) => a.id === 'codebuddy');
   assert.ok(cb, '注册表里应有 codebuddy');
   assert.equal(cb.tier, 2, 'codebuddy 与 Claude Code 同构,属层级②');
@@ -327,8 +328,111 @@ test('codebuddy 已入列,且必须解析到 WorkBuddy 捆绑的那份 CLI', asy
   assert.match(
     d.version ?? '',
     /WorkBuddy bundled/,
-    '必须用 WorkBuddy 捆绑的那份 —— 全局 npm 那份是未登录的,按 PATH 找会找错',
+    '默认仍用 WorkBuddy 捆绑的那份;要换必须显式给覆盖(见下面几条)',
   );
+});
+
+// 2026-09-26 实测:WorkBuddy 应用不升级,它内置的 CLI 就停在 2.147.0 并报
+// "Authentication required",而用户自装的 2.158.0 已登录。桥当时**没有任何口子**能选后者,
+// 只能看着一家 available:true 的 harness 每次派发都失败。下面四条守的就是这个覆盖口。
+
+function fakeCli(dir, body, name = 'fake-codebuddy') {
+  const p = join(dir, name);
+  writeFileSync(p, body, { mode: 0o755 });
+  return p;
+}
+
+test('codebuddy:env 覆盖生效,且 node 入口按当前 node 跑(不 spawn .cmd)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'llms-cb-env-'));
+  const cli = fakeCli(
+    dir,
+    '#!/usr/bin/env node\nprocess.stdout.write("FAKE 9.9.9\\n");\n',
+  );
+  const { createCodeBuddyAdapter } = await import('../src/adapters/codebuddy.ts');
+  const cb = createCodeBuddyAdapter({
+    env: { LLMS_BRIDGE_CODEBUDDY_CLI: cli, LLMS_BRIDGE_HOME: dir },
+  });
+  const d = await cb.detect();
+  assert.equal(d.available, true, `覆盖后应可用,实际: ${d.detail ?? '(无原因)'}`);
+  assert.match(d.version, /FAKE 9\.9\.9/);
+  assert.match(d.version, /LLMS_BRIDGE_CODEBUDDY_CLI/, '要能回答"这次用的是哪一处指定"');
+  // 关键:npm 的 .cmd shim 不能直接 spawn,所以入口必须是 node + js 路径
+  assert.doesNotMatch(d.version, /\.cmd/, '不该把 .cmd shim 当命令名直接 spawn');
+});
+
+test('codebuddy:config.json 的 codebuddyCli 生效,env 优先级更高', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'llms-cb-cfg-'));
+  const fromCfg = fakeCli(
+    dir,
+    '#!/usr/bin/env node\nprocess.stdout.write("FROM-CFG\\n");\n',
+    'stub-from-cfg',
+  );
+  const fromEnv = fakeCli(
+    dir,
+    '#!/usr/bin/env node\nprocess.stdout.write("FROM-ENV\\n");\n',
+    'stub-from-env',
+  );
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({ codebuddyCli: fromCfg }));
+  const { createCodeBuddyAdapter } = await import('../src/adapters/codebuddy.ts');
+
+  const viaCfg = await createCodeBuddyAdapter({ env: { LLMS_BRIDGE_HOME: dir } }).detect();
+  assert.equal(viaCfg.available, true, `配置文件应被吃到,实际: ${viaCfg.detail}`);
+  assert.match(viaCfg.version, /FROM-CFG/);
+  assert.match(viaCfg.version, /config\.json/, '要能回答"是哪份配置文件指定的"');
+
+  const viaEnv = await createCodeBuddyAdapter({
+    env: { LLMS_BRIDGE_HOME: dir, LLMS_BRIDGE_CODEBUDDY_CLI: fromEnv },
+  }).detect();
+  assert.match(viaEnv.version, /FROM-ENV/, 'env 比配置文件更临时,应压过 config.json');
+});
+
+test('codebuddy:覆盖指向不存在的路径时明确失败,绝不静默退回 bundled', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'llms-cb-missing-'));
+  const { createCodeBuddyAdapter } = await import('../src/adapters/codebuddy.ts');
+  const d = await createCodeBuddyAdapter({
+    env: { LLMS_BRIDGE_CODEBUDDY_CLI: join(dir, 'nope.js'), LLMS_BRIDGE_HOME: dir },
+  }).detect();
+  assert.equal(d.available, false, '指错了就要响 —— 静默退回 bundled 等于让调用方以为在用新版');
+  assert.match(d.detail, /不存在/);
+  assert.match(d.detail, /不会.*悄悄退回|不会悄悄退回|不.*悄悄退回/, '失败原因要指路');
+});
+
+test('codebuddy:npm .cmd shim 解析出真实 js 入口,不过 shell', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'llms-cb-shim-'));
+  const entryDir = join(dir, 'node_modules', 'fake-pkg', 'bin');
+  mkdirSync(entryDir, { recursive: true });
+  const entry = join(entryDir, 'codebuddy');
+  writeFileSync(
+    entry,
+    '#!/usr/bin/env node\nprocess.stdout.write("SHIM-OK " + (process.argv[2] ?? "") + "\\n");\n',
+  );
+  const shim = join(dir, 'codebuddy.cmd');
+  writeFileSync(
+    shim,
+    '@ECHO off\r\n:start\r\nSETLOCAL\r\nIF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n  SET "_prog=node"\r\n)\r\n' +
+      `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\fake-pkg\\bin\\codebuddy" %*\r\n`,
+  );
+  const { createCodeBuddyAdapter } = await import('../src/adapters/codebuddy.ts');
+  const cb = createCodeBuddyAdapter({
+    env: { LLMS_BRIDGE_CODEBUDDY_CLI: shim, LLMS_BRIDGE_HOME: dir },
+  });
+  const d = await cb.detect();
+  assert.equal(d.available, true, `shim 应被解析,实际: ${d.detail}`);
+  assert.match(d.version, /SHIM-OK --version/, 'detect 的 --version 必须落到解析出的 js 入口上');
+  assert.match(d.version, /node_modules/, 'label 要写出真实入口,让人能核对用的是哪份');
+
+  const plan = cb.plan({
+    taskId: 't',
+    harness: 'codebuddy',
+    prompt: '带 & 和 | 的 prompt "引号" 以及中文',
+    cwd: process.cwd(),
+    approval: 'read-only',
+    budget: { maxWallMs: 1000 },
+    session: { mode: 'fresh' },
+  });
+  assert.equal(plan.command, process.execPath, '不能 spawn .cmd,也不能走 shell');
+  assert.ok(!plan.args.some((a) => /%_prog%|%dp0%/.test(a)), 'shim 里的变量占位不该漏进 argv');
+  assert.equal(plan.args[plan.args.length - 1], '带 & 和 | 的 prompt "引号" 以及中文');
 });
 
 test('codebuddy 的 argv 构造符合实测的旗标', () => {
