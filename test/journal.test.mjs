@@ -7,6 +7,8 @@
  * 必须有用例钉住。测试用**两个 Scheduler 实例**模拟"进程换了、内存清空了"。
  *
  * 索引路径由 LLMS_BRIDGE_HOME 指到临时目录,绝不碰真用户目录。
+ * 2026-10-05 起事件流也落盘(<taskId>.events.jsonl),所以"过程"也能跨进程回放 ——
+ * 上限截断与脱敏的用例在 test/event-log.test.mjs。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -141,7 +143,7 @@ test('停在 running 的记录:判为中断,且不许让调用方无限轮询', 
     assert.equal(snap.finished, true, '回 finished=false 会让调用方一直轮询一个已不存在的进程');
     assert.equal(snap.status, 'failed');
     assert.match(snap.reason ?? '', /桥进程已经消失/);
-    assert.equal(snap.eventCount, 0, '事件流没落盘,不许假装有历史');
+    assert.ok(snap.eventCount >= 1, '事件流已落盘:进程死了也要数得出它跑过几步,不许回 0');
 
     const result = await after.collect('t-dead');
     assert.equal(result.status, 'failed');
@@ -161,15 +163,40 @@ test('真的查无此 ID 时,措辞必须与"进程死了"区分开', async () =
   await assert.rejects(() => scheduler.collect('t-typo-xyz'), /账本里都没有它/);
 });
 
-test('账本存在但事件流没有:events() 要说清,而不是回空数组', async () => {
+test('桥重启后 events() 从落盘事件流把过程回放出来', async () => {
+  const repo = await makeRepo();
+  try {
+    const before = new Scheduler([makeStub({ resultText: 'X' })]);
+    await before.dispatch(specFor(repo, 't-replay'));
+    await before.idle();
+
+    const after = new Scheduler([makeStub()]);
+    const events = after.events('t-replay');
+    assert.equal(events.length, 2, `应有 message+result 两条:${JSON.stringify(events)}`);
+    assert.equal(events[0].text, 'STUB_OUT');
+    assert.equal(events[1].text, 'X');
+    assert.equal(events[0].harness, 'stub', '落盘行不重复存 harness,回放时要从记录补回');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test('事件流文件读不到时 events() 要说清,而不是回空数组', async () => {
+  // 早于事件落盘功能的旧账本就长这样;新任务写不出去(盘满、权限)也走这条路。
+  // 回空数组会被读成"它跑过,但一个事件都没出" —— 那是个不存在的事实。
   const repo = await makeRepo();
   try {
     const before = new Scheduler([makeStub({ resultText: 'X' })]);
     await before.dispatch(specFor(repo, 't-noev'));
     await before.idle();
+    await rm(join(repo, '.llms-bridge', 'tasks', 't-noev.events.jsonl'), { force: true });
 
     const after = new Scheduler([makeStub()]);
-    assert.throws(() => after.events('t-noev'), /无法回放/);
+    assert.throws(() => after.events('t-noev'), /事件流读不到/);
+    // 过程看不到,不该连带把产出也弄丢。
+    const result = await after.collect('t-noev');
+    assert.equal(result.text, 'X');
+    assert.equal(result.eventCount, 0, '没有文件就是 0,不许拿心跳的数顶上');
   } finally {
     await rm(repo, { recursive: true, force: true });
   }

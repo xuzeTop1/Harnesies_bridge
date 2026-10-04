@@ -136,10 +136,15 @@ worktree 的形态由调用方显式选(默认永远是"新建 + 隔离"):
 端点**未知**一律按不可信处理 —— 今天只有 claude 自报 egress,所以空名单下它以外的都会被拒;
 文件坏掉或键名写错也按拒处理(建它是为了限制,解析失败不该悄悄解除)。
 
-任务状态只在进程内存里,但**账本落盘**:派发即写 `<cwd>/.llms-bridge/tasks/<taskId>.json`
-(含 prompt、结果正文、状态、用量、egress 主机),索引在 `~/.llms-bridge/tasks-index.jsonl`。
-宿主重启后 `harness_poll` / `harness_result` 会自动回退读账本,返回 `fromJournal: true`
-(事件流不落盘,无法回放);记录停在 `running` 表示持有它的进程消失了。
+任务状态只在进程内存里,但**账本、心跳与事件流都落盘**:派发即写 `<cwd>/.llms-bridge/tasks/<taskId>.json`
+(含 prompt、结果正文、状态、用量、egress 主机)、`<taskId>.beat.json`(进度心跳),
+并逐条追加 `<taskId>.events.jsonl`(status / message / tool_call / tool_result / diff / …)。
+事件写盘前按字段名隐去凭证值,单字段与单任务分别有体积上限(`LLMS_BRIDGE_EVENT_FIELD_CAP` /
+`LLMS_BRIDGE_EVENT_BYTES_CAP`),截断与撞上限都会留下可见标记 —— 差额由"盘上几行 vs 心跳记几条"暴露,不做静默丢。
+索引在 `~/.llms-bridge/tasks-index.jsonl`。
+宿主重启后 `harness_poll` / `harness_result` / `harness_events` 会自动回退读盘,返回 `fromJournal: true`;
+记录停在 `running` 表示持有它的进程消失了。隔离任务的账本与事件流都在那个 worktree 里,
+**清理 worktree 会连带删掉它们**。
 
 ## 三层集成,一套事件模型
 
@@ -194,8 +199,9 @@ Anthropic 端点、端点是从哪一层读到的、以及本机代理线索。
 node src/cli.ts ui          # 打印实际 URL,并登记在 ~/.llms-bridge/ui.json
 ```
 
-显示三件事:**当前进度**(在跑 / 在等输出 / 疑似失联 / 已结束 + 事件数 + 最后输出多久前)、
-**分发情况**(harness、模型、档位、是否隔离、目录、结果或原因)、
+显示四件事:**当前进度**(在跑 / 在等输出 / 疑似失联 / 已结束 + 事件数 + 最后输出多久前)、
+**分发情况**(按工作区分组:一个 worktree 一栏,里面是它的各轮往来 —— harness、模型、档位、是否隔离、结果或原因)、
+**会话过程**(点任务号读那一轮的 prompt、逐条事件 `tool_call` / `tool_result` / `diff` 与结果原文)、
 **各家 LLM 用量**(任务数、成败、token 合计、未自报用量的条数、用过哪些模型)。
 
 三条边界，都是刻意的：
@@ -204,7 +210,8 @@ node src/cli.ts ui          # 打印实际 URL,并登记在 ~/.llms-bridge/ui.js
   面板能改状态的那一刻,它就成了第二个主脑,而它比主脑更没有上下文。
 - **只听 `127.0.0.1`,端口由系统分配**(AGENTS.md 禁硬编码端口)。传 `--host 0.0.0.0` 会被直接拒绝:
   账本里躺着各家任务的 prompt 与模型原文。
-- **数据只来自落盘账本 + 心跳文件**,所以面板和桥谁先起、桥重启几次都不影响它看到历史。
+- **数据只来自落盘账本 + 心跳 + 事件流文件**,所以面板和桥谁先起、桥重启几次都不影响它看到历史。
+  面板是**另一个进程**,读不到桥的内存 —— 事件流不落盘之前,"正在跑的会话"根本无从显示。
 
 进度为什么可信:`status:'running'` 单独看**毫无信息量**(进程被杀时它就永远停在 running)。
 所以桥每 3 秒写一个几百字节的心跳(`.llms-bridge/tasks/<id>.beat.json`),面板据此区分
@@ -221,8 +228,8 @@ src/
   audit.ts        事后磁盘审计:派发前后比对调用方 cwd,抓越界写(只报告,不回滚)
   enforcement.ts  档位的"拦不拦得住"语义:enforced / advisory / unknown,缺省 unknown
   redact.ts       事件出口按字段名隐去凭证值(按值形态判断会误伤预算要用的 token 计数)
-  journal.ts      任务账本:进程消失后仍能回答"派发过什么、最后怎样、产出了什么",并写进度心跳
-  ui.ts           只读观测面板(127.0.0.1 + 临时端口):进度、分发情况、各家用量
+  journal.ts      任务账本:进程消失后仍能回答"派发过什么、最后怎样、产出了什么",写进度心跳,并逐条落盘事件流
+  ui.ts           只读观测面板(127.0.0.1 + 临时端口):进度、按工作区分组、点开看逐条往来、各家用量
   policy.ts       仓库级云策略(数据能不能出本机)
   egress.ts       数据去向自报(端点主机、是否原生、代理线索)
   locate.ts       找到各家真二进制(Windows 的 shim 不能直接 spawn)

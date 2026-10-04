@@ -9,14 +9,16 @@
  *  3. **渲染不拼 HTML**。页面显示的是各家模型的原文,拼字符串就等于把"漏转义一次"
  *     变成"任意 HTML 注入",而那内容的作者不是我们。所以全程 createElement + textContent。
  *
- * 数据只来自落盘账本 + 心跳文件:桥重启、面板先起后起,都不影响能看到历史。
+ * 数据只来自落盘账本 + 心跳文件 + 事件流文件:桥重启、面板先起后起,都不影响能看到历史。
+ * 面板是**另一个进程**,读不到桥的内存,所以"正在跑的会话"也只能从盘上看 ——
+ * 这正是事件流落盘(2026-10-05)存在的原因。
  */
 import { createServer } from 'node:http';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { listTaskRecords } from './journal.ts';
-import type { ListedTask } from './journal.ts';
+import { eventLogPath, listTaskRecords, locateTaskRecord, readEventLog, readProgress, taskRecordPath } from './journal.ts';
+import type { EventLogLine, ListedTask, TaskProgress, TaskRecord } from './journal.ts';
 
 function bridgeHome(): string {
   return process.env.LLMS_BRIDGE_HOME ?? join(homedir(), '.llms-bridge');
@@ -94,6 +96,19 @@ async function handle(
     res.end(JSON.stringify(buildState()));
     return;
   }
+  if (path === '/api/task') {
+    const query = new URLSearchParams((req.url ?? '').split('?')[1] ?? '');
+    const taskId = query.get('task_id') ?? '';
+    // taskId 会参与拼盘路径,而它是 HTTP 查询参数 = 系统边界。只收我们自己写出去过的形状。
+    if (!/^[\w.-]{1,64}$/.test(taskId)) {
+      res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ found: false, why: 'task_id 形状不合法(只收字母、数字、点、下划线、连字符)' }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(buildTaskView(taskId)));
+    return;
+  }
   if (path !== '/' && path !== '/index.html') {
     res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
     res.end('not found\n');
@@ -122,7 +137,108 @@ export interface PanelState {
   totals: { all: number; running: number; lost: number; finished: number };
   byHarness: HarnessUsage[];
   tasks: ListedTask[];
+  /** 按工作区归组:一个 worktree 一栏,里面是它的各轮往来。 */
+  workgroups: Workgroup[];
   notes: string[];
+}
+
+/**
+ * 一个工作区(bridge 建的 worktree、复用的 worktree、或未隔离的 cwd)。
+ *
+ * 为什么以工作区而不是以任务为主键:同一个 worktree 上的多轮派发是**同一件事的连续状态**
+ * (第二轮读得到第一轮的改动),按任务摊平就把这条线切断了 —— 而人回看时要的正是这条线。
+ */
+export interface Workgroup {
+  path: string;
+  kind: 'bridge-worktree' | 'reused-worktree' | 'unisolated';
+  /** 它从哪个仓库来的;未隔离时就是那个目录本身。 */
+  repo: string;
+  tasks: number;
+  running: number;
+  harnesses: string[];
+  lastStartedAt: number;
+}
+
+const WORKTREE_MARK = '/.llms-bridge/worktrees/';
+
+function groupTasks(listed: ListedTask[]): Workgroup[] {
+  const byPath = new Map<string, Workgroup>();
+  for (const t of listed) {
+    const path = t.worktreePath ?? t.cwd;
+    const normalized = path.replaceAll('\\', '/');
+    const g = byPath.get(path) ?? {
+      path,
+      kind: !t.isolated
+        ? 'unisolated'
+        : normalized.includes(WORKTREE_MARK)
+          ? 'bridge-worktree'
+          : 'reused-worktree',
+      // 未隔离时仓库就是调用方给的目录;worktree 则从容器目录反推主仓库。
+      repo: t.isolated && normalized.includes(WORKTREE_MARK) ? normalized.split(WORKTREE_MARK)[0]! : (t.requestedCwd || path),
+      tasks: 0,
+      running: 0,
+      harnesses: [],
+      lastStartedAt: 0,
+    } as Workgroup;
+    g.tasks++;
+    if (t.liveness === 'running' || t.liveness === 'awaiting_output') g.running++;
+    if (!g.harnesses.includes(t.harness)) g.harnesses.push(t.harness);
+    g.lastStartedAt = Math.max(g.lastStartedAt, t.startedAt);
+    byPath.set(path, g);
+  }
+  return [...byPath.values()].sort((a, b) => b.lastStartedAt - a.lastStartedAt);
+}
+
+/**
+ * 单次派发的完整视图:账本记录 + 心跳进度 + 落盘事件流。
+ *
+ * `eventsOnDisk` 与 `eventsKnown` 必须都给:前者是盘上真有的行数,后者是心跳记的事件总数。
+ * 只给一个数,调用方就无从知道"过程缺了" —— 差额来自撞字节上限、或桥被杀前没写出来。
+ */
+export interface TaskView {
+  found: boolean;
+  taskId: string;
+  why?: string;
+  record?: TaskRecord;
+  progress?: TaskProgress;
+  events?: EventLogLine[];
+  eventsOnDisk?: number;
+  eventsKnown?: number;
+  /** 事件流是否撞了每任务字节上限。 */
+  capped?: boolean;
+  /** 读不了 / 被跳过的残行数。 */
+  malformed?: number;
+  recordPath?: string;
+  eventsPath?: string;
+  eventsUnreadable?: string;
+}
+
+export function buildTaskView(taskId: string): TaskView {
+  const found = locateTaskRecord(taskId);
+  if (!found) {
+    return {
+      found: false,
+      taskId,
+      why: '本机账本与索引里都没有这个 taskId —— 要么从没派发过,要么它所在仓库被删/搬走了(桥不猜它去哪了)',
+    };
+  }
+  const { cwd, record } = found;
+  const log = readEventLog(cwd, taskId);
+  const progress = readProgress(cwd, taskId, record);
+  return {
+    found: true,
+    taskId,
+    record,
+    progress,
+    events: log.lines,
+    eventsOnDisk: log.total,
+    eventsKnown: progress.events,
+    capped: log.capped,
+    malformed: log.malformed,
+    recordPath: taskRecordPath(cwd, taskId),
+    eventsPath: eventLogPath(cwd, taskId),
+    ...(log.unreadable === undefined ? {} : { eventsUnreadable: log.unreadable }),
+  };
 }
 
 export function buildState(now = Date.now()): PanelState {
@@ -163,10 +279,13 @@ export function buildState(now = Date.now()): PanelState {
     totals: { all: listed.length, running, lost, finished },
     byHarness: [...byHarness.values()].sort((a, b) => b.tasks - a.tasks),
     tasks: listed,
+    workgroups: groupTasks(listed),
     notes: [
       'token 只统计各家自报的部分;0 可能是"该家不报用量",不等于没用过。',
       '面板只读:派发仍然只走 MCP 的 harness_dispatch,这里没有任何写接口。',
       'liveness=heartbeat_lost 时记录本身可能仍写着 running —— 那代表"桥不再心跳",不代表模型失败。',
+      '事件流按逐字段与逐任务上限落盘,超长会被截断并标记;diff 的完整那一份留在 worktree 里,不在这里。',
+      'prompt、模型原文与事件流都落在本机磁盘(.llms-bridge/tasks/),清理 worktree 会连带删掉它的事件流。',
     ],
   };
 }
@@ -191,16 +310,29 @@ const PAGE = `<!doctype html>
  .note { color: #8b949e; font-size: 11px }
  .bar { height: 3px; background: #58a6ff; border-radius: 2px; margin-top: 4px }
  ul.notes { color: #8b949e; font-size: 12px; padding-left: 18px }
+ .group { background: #171b21; border: 1px solid #262c34; border-radius: 7px; padding: 10px 12px; margin-bottom: 12px }
+ .ghead { margin-bottom: 6px }
+ .ghead b { display: block; font-size: 12px; word-break: break-all }
+ button { font: inherit; background: #21262d; color: #dfe3e8; border: 1px solid #30363d; border-radius: 5px; padding: 2px 8px; cursor: pointer }
+ button:hover { border-color: #58a6ff }
+ .detail { background: #171b21; border: 1px solid #262c34; border-radius: 7px; padding: 12px 14px; color: #dfe3e8 }
+ .detail h2 { font-size: 13px; margin: 14px 0 6px; color: #8b949e; font-weight: 500 }
+ pre { margin: 0; padding: 8px 10px; background: #101317; border: 1px solid #22272e; border-radius: 5px; white-space: pre-wrap; word-break: break-word; font-size: 12px }
+ .ev { display: flex; gap: 8px; border-bottom: 1px solid #22272e; padding: 4px 0; font-size: 12px }
+ .ev .k { color: #58a6ff; min-width: 92px }
+ .ev .s { color: #8b949e; min-width: 52px }
+ .ev .t { flex: 1; word-break: break-word }
+ .warn { color: #d29922; font-size: 12px }
 </style></head>
 <body>
 <h1>LLMS Bridge <span class="note">只读观测面</span></h1>
 <div class="sub" id="meta">载入中…</div>
 <div id="cards"></div>
-<h1>任务</h1>
+<h1>工作区</h1>
 <div class="sub" id="empty"></div>
-<table><thead><tr>
- <th>状态</th><th>harness</th><th>模型</th><th>档位</th><th>目录</th><th>进度</th><th>token</th><th>结果 / 原因</th>
-</tr></thead><tbody id="rows"></tbody></table>
+<div id="groups"></div>
+<h1>会话</h1>
+<div class="detail" id="detail">点上面任一行左侧的任务号,读它的 prompt、逐条事件与结果。</div>
 <h1>按 harness 汇总</h1>
 <table><thead><tr><th>harness</th><th>任务</th><th>ok / 失败</th><th>token 合计</th><th>未自报用量</th><th>用过的模型</th></tr></thead><tbody id="usage"></tbody></table>
 <ul class="notes" id="notes"></ul>
@@ -215,6 +347,106 @@ const td = (cls, text) => el('td', cls, text);
 const ago = (ms) => ms == null ? '-' : (ms < 60000 ? Math.round(ms / 1000) + '秒前' : Math.round(ms / 60000) + '分前');
 const lcls = (l) => l === 'running' ? 'run' : l === 'heartbeat_lost' ? 'lost' : l === 'finished' ? 'ok' : 'note';
 const swap = (id, node) => { const old = document.getElementById(id); old.replaceWith(node); node.id = id; };
+const kindLabel = (k) => k === 'bridge-worktree' ? '桥建 worktree(已隔离)'
+  : k === 'reused-worktree' ? '复用 worktree(已隔离)'
+  : '未隔离(直接落在调用方给的目录)';
+const preview = (x, n) => {
+  const s = typeof x === 'string' ? x : JSON.stringify(x);
+  return s.length > n ? s.slice(0, n) + '…' : s;
+};
+const HEADS = ['任务', '状态', 'harness', '模型', '档位', '进度', 'token', '结果 / 原因'];
+
+/**
+ * 会话详情:prompt → 逐条事件 → 结果。
+ *
+ * 全程 textContent:这里显示的是**别的厂商模型写出来的原文**,拼 HTML 等于把
+ * "漏转义一次"变成"任意 HTML 注入"。
+ */
+async function showTask(taskId) {
+  let d;
+  try {
+    d = await (await fetch('/api/task?task_id=' + encodeURIComponent(taskId))).json();
+  } catch (e) {
+    const box = el('div', 'detail');
+    box.append(el('div', 'warn', '读不到详情:' + e.message));
+    swap('detail', box);
+    return;
+  }
+  const box = el('div', 'detail');
+  if (!d.found) {
+    box.append(el('div', null, '查无此任务 ' + d.taskId));
+    box.append(el('div', 'warn', d.why || ''));
+    swap('detail', box);
+    return;
+  }
+  const r = d.record;
+  box.append(el('div', null, r.taskId));
+  box.append(el('div', 'note', r.harness + ' · 模型 ' + (r.model || '(该家默认)') + ' · 档位 ' + r.approval +
+    (r.isolated ? ' · 已隔离' : ' · 未隔离') + ' · 会话 ' + r.sessionMode + ' · 层级 ' + r.tier));
+  box.append(el('div', 'note', '工作区 ' + r.cwd + (r.egressHost ? ' · 这次数据发往 ' + r.egressHost : ' · 数据去向该家未自报')));
+  box.append(el('div', 'note', new Date(r.startedAt).toLocaleString() +
+    (r.endedAt ? ' → ' + new Date(r.endedAt).toLocaleTimeString() : ' → 没写下结束时刻')));
+  box.append(el('div', r.status === 'ok' ? 'ok' : 'bad', 'status=' + r.status + ' | ' + d.progress.note));
+
+  if (d.eventsUnreadable) {
+    box.append(el('div', 'warn', '事件流读不到:' + d.eventsUnreadable + ' —— 早于事件落盘的旧账本就长这样,过程确实不可回放'));
+  } else if (d.eventsKnown > d.eventsOnDisk) {
+    box.append(el('div', 'warn', '盘上 ' + d.eventsOnDisk + ' 条,心跳记 ' + d.eventsKnown + ' 条:差额是撞字节上限或桥被杀前没写出来,别当成"过程都在这"'));
+  }
+  if (d.capped) box.append(el('div', 'warn', '这份事件流撞过每任务字节上限,后面的事件没落盘'));
+  if (d.malformed) box.append(el('div', 'warn', d.malformed + ' 行残行被跳过(崩在写一半留下的半个 JSON)'));
+
+  box.append(el('h2', null, 'prompt'));
+  box.append(el('pre', null, preview(r.prompt || '', 4000)));
+  box.append(el('h2', null, '事件流(逐条往来,尾部 ' + d.events.length + ' 条)'));
+  const evs = el('div');
+  if (d.events.length === 0) evs.append(el('div', 'note', '(没有落盘的事件)'));
+  for (const l of d.events) {
+    const row = el('div', 'ev');
+    row.append(el('span', 's', '#' + l.seq));
+    row.append(el('span', 'k', l.marker ? '上限标记' : l.type));
+    row.append(el('span', 'note', new Date(l.at).toLocaleTimeString()));
+    row.append(el('span', 't', (l.text || '') + (l.raw === undefined ? '' : '  ⟵ ' + preview(l.raw, 300)) + (l.clipped ? '  [已截断]' : '')));
+    evs.append(row);
+  }
+  box.append(evs);
+  box.append(el('h2', null, '结果'));
+  box.append(el('pre', null, preview(r.text || '(没有产出正文)', 4000)));
+  if (r.reason) {
+    box.append(el('h2', null, '原因'));
+    box.append(el('pre', 'warn', r.reason));
+  }
+  box.append(el('div', 'note', '账本 ' + d.recordPath + ' · 事件流 ' + d.eventsPath));
+  swap('detail', box);
+}
+
+function taskRow(r) {
+  const tr = document.createElement('tr');
+  const c0 = document.createElement('td');
+  const btn = el('button', null, r.taskId.slice(0, 8));
+  btn.title = '读这次派发的 prompt、逐条事件与结果';
+  btn.addEventListener('click', function () { showTask(r.taskId); });
+  c0.append(btn);
+  tr.append(c0);
+  const c1 = el('td', lcls(r.liveness));
+  c1.append(el('span', null, r.liveness));
+  if (r.status !== 'running') c1.append(el('div', 'note', 'status=' + r.status));
+  tr.append(c1);
+  tr.append(td(null, r.harness));
+  tr.append(td('note', r.model || '(默认)'));
+  tr.append(td('note', (r.approval || '-') + (r.isolated ? '' : '  未隔离')));
+  const c5 = el('td');
+  c5.append(el('div', null, r.events + ' 事件 · 最后输出 ' + ago(r.lastEventAgoMs)));
+  const bar = el('div', 'bar');
+  const live = r.liveness === 'running' || r.liveness === 'awaiting_output';
+  bar.style.width = (live ? Math.min(100, 8 + r.events * 2) : 100) + '%';
+  c5.append(bar);
+  c5.append(el('div', 'note', r.livenessNote));
+  tr.append(c5);
+  tr.append(td(null, r.tokens));
+  tr.append(td('note', (r.text || r.reason || '').slice(0, 260)));
+  return tr;
+}
 
 async function tick() {
   let s;
@@ -238,30 +470,29 @@ async function tick() {
   document.getElementById('empty').textContent = t.all
     ? '' : '还没有任务记录。派一个活,或检查 LLMS_BRIDGE_HOME 与账本所在仓库是否一致。';
 
-  const rows = el('tbody');
-  for (const r of s.tasks) {
-    const live = r.liveness === 'running' || r.liveness === 'awaiting_output';
-    const tr = document.createElement('tr');
-    const c0 = td(lcls(r.liveness), r.liveness);
-    if (r.status !== 'running') c0.append(el('div', 'note', 'status=' + r.status));
-    tr.append(c0);
-    tr.append(td(null, r.harness));
-    tr.append(td('note', r.model || '(默认)'));
-    const c3 = td('note', (r.approval || '-') + (r.isolated ? '' : '  未隔离'));
-    tr.append(c3);
-    tr.append(td('note', r.requestedCwd || r.cwd));
-    const c5 = td(null, r.events + ' 事件 · 最后输出 ' + ago(r.lastEventAgoMs));
-    // 走 CSSOM 而非标记解析,数值也是本地算出来的。
-    const bar = el('div', 'bar');
-    bar.style.width = (live ? Math.min(100, 8 + r.events * 2) : 100) + '%';
-    c5.append(bar);
-    c5.append(el('div', 'note', r.livenessNote));
-    tr.append(c5);
-    tr.append(td(null, r.tokens));
-    tr.append(td('note', (r.text || r.reason || '').slice(0, 260)));
-    rows.append(tr);
+  const groups = el('div');
+  for (const g of s.workgroups) {
+    const box = el('div', 'group');
+    const head = el('div', 'ghead');
+    head.append(el('b', null, g.path));
+    head.append(el('div', 'note', kindLabel(g.kind) + ' · 来自 ' + g.repo + ' · ' + g.tasks + ' 轮' +
+      (g.running ? ' · ' + g.running + ' 在跑' : '') + ' · harness ' + g.harnesses.join('/')));
+    box.append(head);
+    const table = document.createElement('table');
+    const htr = document.createElement('tr');
+    for (const h of HEADS) htr.append(el('th', null, h));
+    const thead = document.createElement('thead');
+    thead.append(htr);
+    const tbody = document.createElement('tbody');
+    // 组内按派发先后正序:多轮往来要按它发生的顺序读, newest-first 会把对话倒过来。
+    const mine = s.tasks.filter(function (r) { return (r.worktreePath || r.cwd) === g.path; })
+      .sort(function (a, b) { return a.startedAt - b.startedAt; });
+    for (const r of mine) tbody.append(taskRow(r));
+    table.append(thead, tbody);
+    box.append(table);
+    groups.append(box);
   }
-  swap('rows', rows);
+  swap('groups', groups);
 
   const usage = el('tbody');
   for (const u of s.byHarness) {

@@ -5,7 +5,9 @@ import {
   readTaskBeat,
   recordDispatch,
   recordFinish,
+  readEventLog,
   readProgress,
+  appendEvent,
   startHeartbeat,
   taskRecordPath,
 } from './journal.ts';
@@ -138,7 +140,7 @@ function journalNote(record: TaskRecord, cwd: string): { reason: string; journal
       record.status === 'running'
         ? `账本记录停在 running(${at} 派出),但持有它的桥进程已经消失:本进程内存里没有该任务,` +
           `它不会再有任何进展,也没有结果可取。这**不代表任务失败**,只代表状态断了 —— 需要产出就得重派。`
-        : `该任务由**上一个桥进程**派发(${at}),本进程内存里没有它;以下内容来自落盘账本,事件流无法回放。`,
+        : `该任务由**上一个桥进程**派发(${at}),本进程内存里没有它;结果与事件流都读自落盘账本。`,
   };
 }
 
@@ -368,6 +370,17 @@ export class Scheduler {
     let tokens = 0;
     let overBudget = false;
 
+    /**
+     * 事件同时进内存(harness_events 即时读)与落盘(桥死了、面板是另一个进程,都还得能读)。
+     * 脱敏收在这一个出口而不是各推送点:推送点会随适配器演进增加,漏一个就是把明文写进盘 ——
+     * 而落盘比交回主脑更难撤回。
+     */
+    const emit = (e: BridgeEvent): void => {
+      const safe = e.raw === undefined ? e : { ...e, raw: redactCredentials(e.raw) };
+      state.events.push(safe);
+      appendEvent(spec.cwd, safe);
+    };
+
     // 心跳:让"这个任务还在被看着"这件事有落盘证据,面板才谈得上进度。
     // 交给 dispatch 那边的 finally 统一停 —— 放在这里 stop 会漏掉抛异常那条路。
     const beat = startHeartbeat(spec.cwd, spec.taskId, () => {
@@ -393,8 +406,8 @@ export class Scheduler {
       onLine: (line) => {
         for (const e of parser.parseLine(line)) {
           // 适配器把外部 CLI 的原样返回塞在 raw 里,可能夹带凭证(qwen 的 set_model 就带过),
-          // 而 raw 会经 harness_events 交给主脑 —— 那可能是别的厂商的云端模型。见 src/redact.ts。
-          state.events.push(e.raw === undefined ? e : { ...e, raw: redactCredentials(e.raw) });
+          // 而 raw 会经 harness_events 交给主脑,也会写进事件流文件。见 src/redact.ts。
+          emit(e);
           if (e.usage) {
             tokens = (e.usage.inputTokens ?? 0) + (e.usage.outputTokens ?? 0);
             if (spec.budget.maxTokens !== undefined && tokens > spec.budget.maxTokens) {
@@ -447,7 +460,7 @@ export class Scheduler {
           const truncated = patch.length > DIFF_CAP;
           diffTruncated = truncated;
           capturedDiff = truncated ? patch.slice(0, DIFF_CAP) + '\n...[diff 已截断]' : patch;
-          state.events.push({
+          emit({
             taskId: spec.taskId,
             seq: state.events.length,
             harness: adapter.id,
@@ -458,7 +471,7 @@ export class Scheduler {
             raw: capturedDiff,
           });
         } else {
-          state.events.push({
+          emit({
             taskId: spec.taskId,
             seq: state.events.length,
             harness: adapter.id,
@@ -469,7 +482,7 @@ export class Scheduler {
           });
         }
       } catch (err) {
-        state.events.push({
+        emit({
           taskId: spec.taskId,
           seq: state.events.length,
           harness: adapter.id,
@@ -489,7 +502,7 @@ export class Scheduler {
       (e) => e.type === 'result' && e.text === fin.text,
     );
     if (!alreadyHasResult) {
-      state.events.push({
+      emit({
         taskId: spec.taskId,
         seq: state.events.length,
         harness: adapter.id,
@@ -574,8 +587,9 @@ export class Scheduler {
           // 它再也不会推进:回 finished=false 会让调用方无限轮询一个已不存在的进程。
           finished: true,
           status: record.status === 'running' ? 'failed' : record.status,
-          // 事件流只在内存里,没落盘 —— 回 0 而不是假装有历史。
-          eventCount: 0,
+          // 事件流现在读得回来了,但给的是**落盘的那些行**:撞字节上限、写不进去、早于此功能的
+          // 老账本都只能让它少于心跳里的事件总数。两个数面板都会显示,不挑一个好看的。
+          eventCount: readEventLog(cwd, taskId, Infinity).total,
           usageTokens: record.usage
             ? (record.usage.inputTokens ?? 0) + (record.usage.outputTokens ?? 0)
             : undefined,
@@ -625,16 +639,32 @@ export class Scheduler {
   events(taskId: string): BridgeEvent[] {
     const state = this.#tasks.get(taskId);
     if (state) return state.events;
-    // 账本里只留了"是什么、最后怎样、产出了什么",**没有事件流** —— 过程不可回放。
-    // 这里直接说清,好过回一个空数组让调用方以为"跑过但没事件"。
     const found = locateTaskRecord(taskId);
-    if (found) {
+    if (!found) {
+      throw new DispatchRejected(`未知 taskId: ${taskId} —— 本进程内存与本机账本里都没有它。`);
+    }
+    const { record, cwd } = found;
+    const log = readEventLog(cwd, taskId, Infinity);
+    if (log.total === 0) {
+      // 读不到就明说读不到,不回空数组 —— 空数组会被读成"跑过,但一个事件都没有"。
       throw new DispatchRejected(
-        `taskId ${taskId} 只在账本里(${taskRecordPath(found.cwd, taskId)}):该任务由上一个桥进程派发,` +
-          `事件流只在进程内存里、没有落盘,无法回放。要判断它跑成什么样,请用 harness_result 读账本里的结果。`,
+        `taskId ${taskId} 在账本里(${taskRecordPath(cwd, taskId)}),但事件流读不到` +
+          `(${log.unreadable ?? '文件是空的'}):那次派发早于事件落盘,或文件没能写出来。` +
+          `结果仍可用 harness_result 读账本。`,
       );
     }
-    throw new DispatchRejected(`未知 taskId: ${taskId} —— 本进程内存与本机账本里都没有它。`);
+    // 落盘行比 BridgeEvent 扁(harness/tier 存在记录里,不每行重复),回放时补回去。
+    return log.lines.map((l) => ({
+      taskId,
+      seq: l.seq,
+      harness: record.harness,
+      tier: record.tier,
+      type: l.type as BridgeEvent['type'],
+      at: l.at,
+      ...(l.text === undefined ? {} : { text: l.text }),
+      ...(l.usage === undefined ? {} : { usage: l.usage }),
+      ...(l.raw === undefined ? {} : { raw: l.raw }),
+    }));
   }
 
   #modelCache = new Map<string, ModelCatalog | null>();
@@ -697,7 +727,8 @@ export class Scheduler {
       status: interrupted ? 'failed' : record.status,
       text: record.text,
       usage: record.usage,
-      eventCount: 0,
+      // 与 poll 同一口径:落盘了几行就说几行,不为了"看着完整"编一个数。
+      eventCount: readEventLog(cwd, taskId, Infinity).total,
       startedAt: record.startedAt,
       // 没写终态就是**没有**结束时间。此处绝不拿 startedAt 顶替:那会让"被中断"看起来像
       // "开始即结束",调用方据此判断时序会得出完全错误的结论。

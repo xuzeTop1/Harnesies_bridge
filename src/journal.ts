@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, appendFileSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
-import type { TaskSpec, TaskStatus, Tier, Usage } from './types.ts';
+import { dirname, join } from 'node:path';
+import type { BridgeEvent, TaskSpec, TaskStatus, Tier, Usage } from './types.ts';
+import { redactCredentials } from './redact.ts';
 import { ensureBridgeDirExcluded } from './worktree.ts';
 
 /**
@@ -196,6 +197,7 @@ export function locateTaskRecord(taskId: string): { cwd: string; record: TaskRec
     } catch {
       continue;
     }
+    // 全字匹配而不是"包含":调用方传 ../ 形状的 ID 时会先在这里断掉,不会被拼进盘路径。
     if (entry.taskId !== taskId || typeof entry.cwd !== 'string') continue;
     const record = readTaskRecord(entry.cwd, taskId);
     if (record) return { cwd: entry.cwd, record };
@@ -467,4 +469,169 @@ export function listTaskRecords(now = Date.now(), limit = 300): ListedTask[] {
     });
   }
   return out.sort((a, b) => b.startedAt - a.startedAt);
+}
+
+/**
+ * 事件流落盘:每任务一个 jsonl,追加写。
+ *
+ * 为什么不能等任务结束时整份写:进程被杀的那一刻内存里的流水就没了,而"它调了哪些工具、
+ * 停在哪一步"正是中断之后唯一要回看的东西 —— 账本只给了首尾(prompt 与最终 text)。
+ *
+ * 为什么同步写:与记录同理,派发那一刻进程随时可能被杀,异步队列会把"没排上队"变成新的丢失方式。
+ * 代价是每个事件一次小写入,单条体积由下面的字段上限钉住。
+ *
+ * 两个上限都要:
+ *  - 逐字段:一个 `tool_result` 可能是几十万字节的产品文件内容,一条就能顶掉整个任务的上限;
+ *  - 逐任务:长任务事件上千条,不封顶就无界增长(面板不是归档浏览器,见 listTaskRecords)。
+ * 撞上限只写一条标记行;差额由调用方比"心跳里的事件总数"与"落盘行数"得出,不靠标记计数。
+ *
+ * 落盘前一律过 redactCredentials。调度器交过来的 raw 已经隐去凭证字段了,这里再走一次:
+ * 铁律一不设例外,而"信调用方都脱过敏"会变成日后新增写入点时的静默失守。
+ */
+
+/** 单个字段(text、raw 各算一个)的落盘上限。 */
+const EVENT_FIELD_CAP = Number(process.env.LLMS_BRIDGE_EVENT_FIELD_CAP ?? 8_000);
+
+/** 每任务事件流的总字节上限。 */
+const EVENT_BYTES_CAP = Number(process.env.LLMS_BRIDGE_EVENT_BYTES_CAP ?? 2_000_000);
+
+export function eventLogPath(cwd: string, taskId: string): string {
+  return join(cwd, '.llms-bridge', 'tasks', `${taskId}.events.jsonl`);
+}
+
+/** 落盘的一行。比 BridgeEvent 扁:harness/tier 在记录和索引里都有,不必每行重复。 */
+export interface EventLogLine {
+  seq: number;
+  type: string;
+  at: number;
+  text?: string;
+  usage?: Usage;
+  raw?: unknown;
+  /** 这一行的 text 或 raw 被逐字段上限切过。 */
+  clipped?: true;
+  /** 只有撞上限的标记行有它。 */
+  marker?: 'bytes-cap';
+}
+
+/**
+ * 每个文件写到多少字节、是否已撞上限。
+ * 首见时按磁盘现有大小起算:桥重启后接着写同一个任务时,内存计数是零而文件不是 ——
+ * 不这么起算,重启一次就等于白送一个新上限。
+ */
+const written = new Map<string, { bytes: number; capped: boolean }>();
+
+function clipField(value: string): { value: string; clipped: true } | { value: string; clipped?: undefined } {
+  if (value.length <= EVENT_FIELD_CAP) return { value };
+  return { value: value.slice(0, EVENT_FIELD_CAP) + '\n...[事件字段已截断]', clipped: true };
+}
+
+function toLogLine(event: BridgeEvent): EventLogLine {
+  const line: EventLogLine = { seq: event.seq, type: event.type, at: event.at };
+  let clipped = false;
+  if (event.text !== undefined) {
+    const c = clipField(event.text);
+    line.text = c.value;
+    clipped = c.clipped === true;
+  }
+  if (event.usage !== undefined) line.usage = event.usage;
+  if (event.raw !== undefined) {
+    const safe = redactCredentials(event.raw);
+    if (typeof safe === 'string') {
+      const c = clipField(safe);
+      line.raw = c.value;
+      clipped = clipped || c.clipped === true;
+    } else {
+      // 对象先序列化再按同一个上限切:否则一个"看着不大"的嵌套结构能绕过上限。
+      const encoded = JSON.stringify(safe);
+      if (encoded.length > EVENT_FIELD_CAP) {
+        line.raw = encoded.slice(0, EVENT_FIELD_CAP) + '...[事件字段已截断]';
+        clipped = true;
+      } else {
+        line.raw = safe;
+      }
+    }
+  }
+  if (clipped) line.clipped = true;
+  return line;
+}
+
+/** 追加一行事件。写不进去只影响面板能不能看到过程,绝不该影响任务本身。 */
+export function appendEvent(cwd: string, event: BridgeEvent): void {
+  const path = eventLogPath(cwd, event.taskId);
+  let st = written.get(path);
+  if (st === undefined) {
+    st = { bytes: statSync(path, { throwIfNoEntry: false })?.size ?? 0, capped: false };
+    written.set(path, st);
+    mkdirSync(dirname(path), { recursive: true });
+  }
+  if (st.capped) return;
+
+  const encoded = `${JSON.stringify(toLogLine(event))}\n`;
+  if (st.bytes + Buffer.byteLength(encoded, 'utf8') > EVENT_BYTES_CAP) {
+    st.capped = true;
+    const marker: EventLogLine = {
+      seq: -1,
+      type: 'status',
+      at: Date.now(),
+      marker: 'bytes-cap',
+      text: `事件流已达 ${EVENT_BYTES_CAP} 字节上限,此后的事件未落盘 —— 面板上"落盘 N 条"与"共 M 条"对不上就是这个原因`,
+    };
+    try {
+      appendFileSync(path, `${JSON.stringify(marker)}\n`, 'utf8');
+    } catch {
+      /* 标记也写不进就是盘有问题,此时面板会显示两数不等,而不会误显示成"事件都在这" */
+    }
+    return;
+  }
+  try {
+    appendFileSync(path, encoded, 'utf8');
+    st.bytes += Buffer.byteLength(encoded, 'utf8');
+  } catch {
+    /* 见上 */
+  }
+}
+
+export interface EventLogRead {
+  /** 尾部若干行,时间正序。 */
+  lines: EventLogLine[];
+  /** 文件里可解析的总行数(不是尾部的行数)。 */
+  total: number;
+  /** 解析不了被跳过的残行数 —— 崩在写一半会留一行半个 JSON。 */
+  malformed: number;
+  /** 是否撞到逐任务字节上限。 */
+  capped: boolean;
+  /** 文件不存在或读不动时的原因。面板必须区分"没有事件"与"读不到事件"。 */
+  unreadable?: string;
+}
+
+/** 读事件流尾部。默认只取最后 400 行:面板给人看过程,不是给人做全文检索。 */
+export function readEventLog(cwd: string, taskId: string, tail = 400): EventLogRead {
+  const path = eventLogPath(cwd, taskId);
+  if (!existsSync(path)) return { lines: [], total: 0, malformed: 0, capped: false, unreadable: '事件流文件不存在' };
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch (err) {
+    return { lines: [], total: 0, malformed: 0, capped: false, unreadable: `读不动:${(err as Error).message}` };
+  }
+
+  const all: EventLogLine[] = [];
+  let capped = false;
+  let malformed = 0;
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (t.length === 0) continue;
+    try {
+      const parsed = JSON.parse(t) as EventLogLine;
+      if (typeof parsed.seq !== 'number' || typeof parsed.type !== 'string') {
+        malformed++;
+        continue;
+      }
+      if (parsed.marker === 'bytes-cap') capped = true;
+      all.push(parsed);
+    } catch {
+      malformed++;
+    }
+  }
+  return { lines: all.slice(-Math.max(0, tail)), total: all.length, malformed, capped };
 }

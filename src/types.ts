@@ -159,7 +159,8 @@ export interface TaskResult {
   diffTruncated?: boolean;
   /**
    * 该结果来自**落盘账本**而非本进程内存:任务由上一个桥进程派发(宿主重启等),进程已消失。
-   * 此时 `text` 等字段仍然可信,但 `eventCount` 为 0 —— 事件流只在内存里,无法回放。
+   * 此时 `text` 等字段仍然可信,`eventCount` 是事件流文件里落盘的行数 ——
+   * 它可能少于心跳记的事件总数(撞字节上限、早于此功能的旧账本),所以别拿它当"过程都在这"。
    */
   fromJournal?: boolean;
   journalPath?: string;
