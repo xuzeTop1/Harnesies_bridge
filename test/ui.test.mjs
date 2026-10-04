@@ -171,33 +171,31 @@ test('没自报用量的任务计入 unreported,不算"用了 0 token 的成功�
 });
 
 test('按工作区归组:桥建的 worktree 单独一栏,未隔离的另起一栏', async () => {
+  // 临时目录不删:写任务的子进程 cwd 压在那个 worktree 上,Windows 删它会 EBUSY
+  // —— 那会把这个用例抖成红的,而它想钉的是归组逻辑,不是清理(同 test/egress.test.mjs)。
   const repo = await makeRepo();
-  try {
-    const scheduler = new Scheduler([makeAdapter(), makeWriter()]);
-    const w = await scheduler.dispatch({
-      taskId: 'g-write', harness: 'writer', prompt: '改点东西', cwd: repo,
-      approval: 'workspace-write', budget: { maxWallMs: 30_000 }, session: { mode: 'fresh' },
-    });
-    await scheduler.dispatch({
-      taskId: 'g-read', harness: 'stub', prompt: '读一下', cwd: repo,
-      approval: 'read-only', budget: { maxWallMs: 30_000 }, session: { mode: 'fresh' },
-    });
-    await scheduler.idle();
-    assert.equal(w.isolated, true, '写档应自动隔离进 worktree');
+  const scheduler = new Scheduler([makeAdapter(), makeWriter()]);
+  const w = await scheduler.dispatch({
+    taskId: 'g-write', harness: 'writer', prompt: '改点东西', cwd: repo,
+    approval: 'workspace-write', budget: { maxWallMs: 30_000 }, session: { mode: 'fresh' },
+  });
+  await scheduler.dispatch({
+    taskId: 'g-read', harness: 'stub', prompt: '读一下', cwd: repo,
+    approval: 'read-only', budget: { maxWallMs: 30_000 }, session: { mode: 'fresh' },
+  });
+  await scheduler.idle();
+  assert.equal(w.isolated, true, '写档应自动隔离进 worktree');
 
-    const s = buildState();
-    const gw = s.workgroups.find((g) => g.path === w.worktreePath);
-    assert.ok(gw, `worktree 没单独成栏: ${JSON.stringify(s.workgroups.map((g) => g.path))}`);
-    assert.equal(gw.kind, 'bridge-worktree');
-    assert.equal(gw.tasks, 1);
-    assert.equal(gw.repo, repo.replaceAll('\\', '/'), '栏头要写清它来自哪个主仓库');
+  const s = buildState();
+  const gw = s.workgroups.find((g) => g.path === w.worktreePath);
+  assert.ok(gw, `worktree 没单独成栏: ${JSON.stringify(s.workgroups.map((g) => g.path))}`);
+  assert.equal(gw.kind, 'bridge-worktree');
+  assert.equal(gw.tasks, 1);
+  assert.equal(gw.repo, repo.replaceAll('\\', '/'), '栏头要写清它来自哪个主仓库');
 
-    const gr = s.workgroups.find((g) => g.path === repo);
-    assert.equal(gr.kind, 'unisolated', '只读档不分配 worktree,不许显示成隔离了');
-    assert.equal(gr.harnesses.join(','), 'stub');
-  } finally {
-    await rm(repo, { recursive: true, force: true });
-  }
+  const gr = s.workgroups.find((g) => g.path === repo);
+  assert.equal(gr.kind, 'unisolated', '只读档不分配 worktree,不许显示成隔离了');
+  assert.equal(gr.harnesses.join(','), 'stub');
 });
 
 test('会话详情 = 账本正文 + 落盘事件流,两个事件数都给', async () => {

@@ -145,6 +145,8 @@ worktree 的形态由调用方显式选(默认永远是"新建 + 隔离"):
 宿主重启后 `harness_poll` / `harness_result` / `harness_events` 会自动回退读盘,返回 `fromJournal: true`;
 记录停在 `running` 表示持有它的进程消失了。隔离任务的账本与事件流都在那个 worktree 里,
 **清理 worktree 会连带删掉它们**。
+这些正文只落本机:`.llms-bridge/` 在版本化的 `.gitignore` 里(worktree 容器另走
+`.git/info/exclude`),所以它不进 diff、也不随 push 出去 —— 这是"正文可以落盘"的实际依据。
 
 ## 三层集成,一套事件模型
 

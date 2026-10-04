@@ -225,30 +225,27 @@ test('残行跳过并计数:崩在写一半不该让整份事件流读不出来'
 });
 
 test('worker 的改动以 diff 事件落盘(面板据此回答"它到底改了什么")', async () => {
+  // 临时目录不删:写任务的子进程 cwd 压在建好的 worktree 上,Windows 删它会 EBUSY(同 egress 用例)。
   const repo = await makeRepo();
-  try {
-    const writer = {
-      ...makeStub({ stdout: 'EVT0\n' }),
-      supportedApprovals: ['workspace-write'],
-      plan: () => ({
-        command: process.execPath,
-        args: ['-e', "require('node:fs').writeFileSync('WORKER_CHANGE.txt','changed\\n')"],
-      }),
-    };
-    const scheduler = new Scheduler([writer]);
-    const ack = await scheduler.dispatch(
-      specFor(repo, 'e-diff', { approval: 'workspace-write', budget: { maxWallMs: 60_000 } }),
-    );
-    await scheduler.idle();
-    assert.equal(ack.isolated, true, '写档应自动分配 worktree(铁律三)');
+  const writer = {
+    ...makeStub({ stdout: 'EVT0\n' }),
+    supportedApprovals: ['workspace-write'],
+    plan: () => ({
+      command: process.execPath,
+      args: ['-e', "require('node:fs').writeFileSync('WORKER_CHANGE.txt','changed\\n')"],
+    }),
+  };
+  const scheduler = new Scheduler([writer]);
+  const ack = await scheduler.dispatch(
+    specFor(repo, 'e-diff', { approval: 'workspace-write', budget: { maxWallMs: 60_000 } }),
+  );
+  await scheduler.idle();
+  assert.equal(ack.isolated, true, '写档应自动分配 worktree(铁律三)');
 
-    // 隔离任务的产物落在 worktree 里,与记录同目录。
-    const read = readEventLog(ack.worktreePath, 'e-diff');
-    const diffEvent = read.lines.find((l) => l.type === 'diff');
-    assert.ok(diffEvent, `事件流里应有 diff 一条:${JSON.stringify(read.lines)}`);
-    assert.match(diffEvent.text, /WORKER_CHANGE\.txt/, 'diff 的 stat 说清了动了哪些文件');
-    assert.equal(diffEvent.clipped, true, 'patch 超出逐字段上限时要截断并标记,完整的那份留在 worktree 里');
-  } finally {
-    await rm(repo, { recursive: true, force: true });
-  }
+  // 隔离任务的产物落在 worktree 里,与记录同目录。
+  const read = readEventLog(ack.worktreePath, 'e-diff');
+  const diffEvent = read.lines.find((l) => l.type === 'diff');
+  assert.ok(diffEvent, `事件流里应有 diff 一条:${JSON.stringify(read.lines)}`);
+  assert.match(diffEvent.text, /WORKER_CHANGE\.txt/, 'diff 的 stat 说清了动了哪些文件');
+  assert.equal(diffEvent.clipped, true, 'patch 超出逐字段上限时要截断并标记,完整的那份留在 worktree 里');
 });
