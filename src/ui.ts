@@ -47,13 +47,24 @@ export async function startUi(opts: UiOptions = {}): Promise<UiHandle> {
     );
   }
 
+  let port = 0;
   const server = createServer((req, res) => {
-    void handle(req, res);
+    // DNS rebinding: a web page can make its own hostname resolve to 127.0.0.1 and then read this
+    // panel (prompts, model output) from the user's browser. Only loopback Host headers are served.
+    if (!allowedHost(req.headers.host, port)) {
+      res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('forbidden host\n');
+      return;
+    }
+    handle(req, res).catch(() => {
+      if (!res.headersSent) res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('internal error\n');
+    });
   });
 
   await new Promise<void>((resolve) => server.listen(opts.port ?? 0, host, resolve));
   const address = server.address();
-  const port = typeof address === 'object' && address ? address.port : 0;
+  port = typeof address === 'object' && address ? address.port : 0;
 
   const registryPath = join(bridgeHome(), 'ui.json');
   const url = `http://${host}:${port}/`;
@@ -62,7 +73,7 @@ export async function startUi(opts: UiOptions = {}): Promise<UiHandle> {
     writeFileSync(
       registryPath,
       JSON.stringify({ pid: process.pid, port, host, url, startedAt: Date.now() }, null, 2),
-      'utf8',
+      { encoding: 'utf8', mode: 0o600 },
     );
   } catch {
     /* 登记文件写不掉只影响"下次怎么找回端口",不该拦住面板本身 */
@@ -79,10 +90,27 @@ export async function startUi(opts: UiOptions = {}): Promise<UiHandle> {
   };
 }
 
+/** Host header must name a loopback address and this server's port. */
+export function allowedHost(header: string | undefined, port: number): boolean {
+  if (!header) return false;
+  const h = header.trim().toLowerCase();
+  return [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`].includes(h);
+}
+
+const SECURITY_HEADERS: Record<string, string> = {
+  'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'referrer-policy': 'no-referrer',
+  'cross-origin-resource-policy': 'same-origin',
+  'content-security-policy':
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+};
+
 async function handle(
   req: { method?: string; url?: string },
   res: import('node:http').ServerResponse,
 ): Promise<void> {
+  for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.setHeader(k, v);
   const path = (req.url ?? '/').split('?')[0]!;
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8' });
@@ -264,7 +292,7 @@ export function buildState(now = Date.now()): PanelState {
     else if (t.liveness === 'heartbeat_lost') lost++;
     else finished++;
     if (t.status === 'ok') u.ok++;
-    else if (t.status !== 'running') u.failed++;
+    else if (t.status !== 'running' && t.status !== 'cancelled') u.failed++;
     if (t.tokens > 0) u.tokens += t.tokens;
     else u.unreported++;
     // 没点名的任务不许并进某个真实型号里 —— 那会被读成"这家默认就是这个模型"。

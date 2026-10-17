@@ -13,12 +13,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, realpath, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const home = await mkdtemp(join(tmpdir(), 'llms-bridge-journal-home-'));
+const home = await realpath(await mkdtemp(join(tmpdir(), 'llms-bridge-journal-home-')));
 process.env.LLMS_BRIDGE_HOME = home;
 process.env.LLMS_BRIDGE_JOURNAL_CAP = '80';
 
@@ -55,7 +55,7 @@ function makeStub(opts = {}) {
 }
 
 async function makeRepo() {
-  const dir = await mkdtemp(join(tmpdir(), 'llms-bridge-journal-repo-'));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'llms-bridge-journal-repo-')));
   git(dir, ['init', '-q']);
   await writeFile(join(dir, 'seed.txt'), 'seed\n', 'utf8');
   git(dir, ['add', '-A']);

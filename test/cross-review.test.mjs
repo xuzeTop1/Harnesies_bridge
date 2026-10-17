@@ -65,7 +65,11 @@ test('评审基线:测试仓库初始是带 bug 版本,且工作区干净', asyn
     assert.equal(git(repo, ['status', '--short']).trim(), '');
     assert.match(await readFile(join(repo, 'calc.py'), 'utf8'), /return a - b/);
     // 评审方拿到的 cwd 是源仓库(而非生产方的 worktree),所以基线必须仍是错的
-    assert.equal(git(repo, ['branch', '--format=%(refname:short)']).trim(), 'master');
+    assert.equal(
+      git(repo, ['branch', '--format=%(refname:short)']).trim(),
+      git(repo, ['symbolic-ref', '--short', 'HEAD']).trim(),
+      '只有初始分支(名字取决于 git 的 init.defaultBranch)',
+    );
   } finally {
     await rm(repo, { recursive: true, force: true });
   }

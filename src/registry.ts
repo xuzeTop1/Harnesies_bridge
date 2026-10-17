@@ -25,6 +25,8 @@ export function createAdapters(): Adapter[] {
       displayName: 'Qwen Code (ACP)',
       binName: 'qwen',
       pkgName: '@qwen-code/qwen-code',
+      // Qwen Code authenticates with an OpenAI-compatible key (PLAN §3.5) or DashScope.
+      credentialEnv: ['OPENAI_*', 'DASHSCOPE_*', 'QWEN_*'],
     }),
     createAcpAdapter({
       id: 'mimo',

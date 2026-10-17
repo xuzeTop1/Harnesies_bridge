@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -9,6 +10,19 @@ const execFileAsync = promisify(execFile);
 const WORKTREE_DIRNAME = '.llms-bridge';
 const WORKTREE_SUBDIR = 'worktrees';
 const EXCLUDE_ENTRY = `${WORKTREE_DIRNAME}/`;
+
+/**
+ * Canonical spelling of an existing path. macOS reaches temp dirs through /var -> /private/var and
+ * git reports the resolved form; comparing the two spellings rejected valid worktrees as
+ * "another repository" and broke path equality in listWorktrees().
+ */
+export function realpathOr(p: string): string {
+  try {
+    return realpathSync.native(resolve(p));
+  } catch {
+    return resolve(p);
+  }
+}
 
 export async function git(cwd: string, args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   try {
@@ -32,9 +46,16 @@ export async function isGitRepo(dir: string): Promise<boolean> {
 }
 
 export interface Worktree {
-  /** worker 实际的工作目录(隔离出来的那份)。 */
+  /** The new worktree's root. */
   path: string;
+  /**
+   * Where the worker should run: the same sub-directory of the worktree as the caller's cwd is of
+   * the repository (falls back to the worktree root when that directory has no tracked files).
+   */
+  workCwd: string;
   repoRoot: string;
+  /** HEAD at allocation time. Diffs are taken against it, so worker commits are not lost. */
+  baseCommit: string;
 }
 
 /**
@@ -68,18 +89,30 @@ export async function ensureBridgeDirExcluded(repoRoot: string): Promise<void> {
  * 用 `--detach` 而不是开分支:worker 的产出以 diff 形式回收,不需要污染分支列表。
  * 仓库状态(base commit)就是分配时的 HEAD,所以事后 `git diff` 能干净地拿到 worker 的改动。
  */
-export async function allocateWorktree(repoRoot: string, taskId: string): Promise<Worktree> {
-  const base = resolve(repoRoot);
+export async function allocateWorktree(cwd: string, taskId: string): Promise<Worktree> {
+  const callerCwd = realpathOr(cwd);
+  const top = await git(callerCwd, ['rev-parse', '--show-toplevel']);
+  if (!top.ok) throw new Error(`不是 git 工作区: ${top.stderr.trim()}`);
+  const base = realpathOr(top.stdout.trim());
+  const head = await git(base, ['rev-parse', '--verify', '-q', 'HEAD']);
+  if (!head.ok || head.stdout.trim().length === 0) {
+    throw new Error('仓库还没有任何提交(HEAD 不存在),无法从 HEAD 建 worktree;先提交一次再派写任务');
+  }
+  const baseCommit = head.stdout.trim();
+
   const short = taskId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16);
   const path = join(base, WORKTREE_DIRNAME, WORKTREE_SUBDIR, short);
   await mkdir(join(base, WORKTREE_DIRNAME, WORKTREE_SUBDIR), { recursive: true });
   await ensureBridgeDirExcluded(base);
 
-  const r = await git(base, ['worktree', 'add', '--detach', path, 'HEAD']);
+  const r = await git(base, ['worktree', 'add', '--detach', path, baseCommit]);
   if (!r.ok) {
     throw new Error(`分配 worktree 失败: ${r.stderr.trim() || r.stdout.trim()}`);
   }
-  return { path, repoRoot: base };
+  const rel = relative(base, callerCwd);
+  const inside = rel.length > 0 && !rel.startsWith('..') ? join(path, rel) : path;
+  const workCwd = (await stat(inside).catch(() => null))?.isDirectory() ? inside : path;
+  return { path, workCwd, repoRoot: base, baseCommit };
 }
 
 /**
@@ -87,12 +120,25 @@ export async function allocateWorktree(repoRoot: string, taskId: string): Promis
  *
  * 先 `add -A` 再 `diff --cached`:否则新建的文件不会出现在 diff 里。
  * 这个 add 只发生在 worker 自己的 worktree 内,不影响用户的仓库。
+ *
+ * With `baseCommit` the diff is index-vs-base, so commits the worker made inside its worktree are
+ * included (diffing against the moving HEAD used to return an empty diff for a worker that
+ * committed its fix). `--binary` keeps binary changes applicable.
  */
-export async function captureDiff(worktreePath: string): Promise<{ patch: string; stat: string }> {
+export async function captureDiff(
+  worktreePath: string,
+  baseCommit?: string,
+): Promise<{ patch: string; stat: string; commits: string[] }> {
   await git(worktreePath, ['add', '-A']);
-  const statText = await git(worktreePath, ['diff', '--cached', '--stat']);
-  const patch = await git(worktreePath, ['diff', '--cached']);
-  return { patch: patch.stdout, stat: statText.stdout };
+  const against = baseCommit ? [baseCommit] : [];
+  const statText = await git(worktreePath, ['diff', '--cached', '--stat', ...against]);
+  const patch = await git(worktreePath, ['diff', '--cached', '--binary', ...against]);
+  let commits: string[] = [];
+  if (baseCommit) {
+    const log = await git(worktreePath, ['log', '--format=%H %s', `${baseCommit}..HEAD`]);
+    commits = log.ok ? log.stdout.split('\n').filter((l) => l.trim().length > 0) : [];
+  }
+  return { patch: patch.stdout, stat: statText.stdout, commits };
 }
 
 /** 删除 worktree。默认只在调用方明确要求时用 —— 删掉之前先确认 diff 已回收。 */
@@ -115,7 +161,7 @@ export async function removeWorktree(repoRoot: string, worktreePath: string): Pr
  *   4. 不是主工作区本身(`git-dir == git-common-dir` 即主工作区 —— 复用主工作区就是直接写源仓库)。
  */
 export async function resolveReusableWorktree(repoCwd: string, candidate: string): Promise<string> {
-  const abs = resolve(candidate);
+  const abs = realpathOr(candidate);
   const st = await stat(abs).catch(() => null);
   if (!st?.isDirectory()) throw new Error(`复用目标不是已存在的目录: ${abs}`);
 
@@ -127,13 +173,13 @@ export async function resolveReusableWorktree(repoCwd: string, candidate: string
   if (!repoCommon.ok) throw new Error(`无法确认主仓库(${repoCwd})的 git 目录`);
 
   // 两个响应都可能是相对路径,统一按各自的工作区解析成绝对路径再比。
-  const candCommonAbs = resolve(abs, candCommon.stdout.trim());
-  const repoCommonAbs = resolve(repoCwd, repoCommon.stdout.trim());
+  const candCommonAbs = realpathOr(resolve(abs, candCommon.stdout.trim()));
+  const repoCommonAbs = realpathOr(resolve(repoCwd, repoCommon.stdout.trim()));
   if (candCommonAbs !== repoCommonAbs) {
     throw new Error(`复用目标属于另一个仓库(${candCommonAbs} ≠ ${repoCommonAbs}): ${abs}`);
   }
 
-  const candGitAbs = resolve(abs, candGit.stdout.trim());
+  const candGitAbs = realpathOr(resolve(abs, candGit.stdout.trim()));
   if (candGitAbs === candCommonAbs) {
     throw new Error(
       `复用目标就是该仓库的主工作区(不是独立 worktree):${abs}。` +

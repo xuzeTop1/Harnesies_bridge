@@ -24,9 +24,13 @@ export type ApprovalLevel = 'read-only' | 'workspace-write' | 'full';
 export type ApprovalEnforcement = 'enforced' | 'advisory' | 'unknown';
 
 export interface Budget {
-  /** 墙钟上限(毫秒)。超时即中断进程,结果标 timeout。 */
+  /** 墙钟上限(毫秒)。超时即中断进程树,结果标 timeout。 */
   maxWallMs: number;
-  /** 可选的 token 上限。超限标 failed 并如实报告,不静默续跑。 */
+  /**
+   * 可选的 token 上限: cumulative input (including cache reads/writes) + output tokens for the whole
+   * task. Checked as usage arrives; adapters whose CLI reports usage only at the end can only be
+   * checked after the run, and the dispatch ack says so (`max_tokens_enforcement`).
+   */
   maxTokens?: number;
 }
 
@@ -90,9 +94,20 @@ export type EventType =
   | 'error'
   | 'result';
 
+/**
+ * Normalised, cumulative usage for the task so far.
+ * `inputTokens` counts **all** input processed, cache reads and cache writes included (they are
+ * informational sub-totals below); `outputTokens` counts all output. Budget = input + output.
+ */
 export interface Usage {
   inputTokens?: number;
   outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
+
+export function usageTotal(u: Usage | undefined): number {
+  return u ? (u.inputTokens ?? 0) + (u.outputTokens ?? 0) : 0;
 }
 
 export interface BridgeEvent {
@@ -108,7 +123,7 @@ export interface BridgeEvent {
   raw?: unknown;
 }
 
-export type TaskStatus = 'ok' | 'failed' | 'timeout' | 'rejected';
+export type TaskStatus = 'ok' | 'failed' | 'timeout' | 'rejected' | 'cancelled';
 
 export interface TaskResult {
   taskId: string;
@@ -146,6 +161,20 @@ export interface TaskResult {
   model?: string;
   /** 隔离时 worker 实际的工作目录;改动保留在这里,未合并回源仓库。 */
   worktreePath?: string;
+  /** Worktree tasks: the commit the worktree started from; `diff` is taken against it. */
+  baseCommit?: string;
+  /** Commits the worker made inside its worktree (`<sha> <subject>`); their changes are in `diff`. */
+  workerCommits?: string[];
+  /** Full, unredacted patch on local disk (0600). `diff` is the redacted, size-capped copy. */
+  diffPath?: string;
+  /** Number of secret-shaped strings replaced in `diff` (the file at diffPath is untouched). */
+  diffRedactions?: number;
+  /** Names (never values) of credential variables withheld from the worker's environment. */
+  envWithheld?: string[];
+  /** How `usage` was obtained and whether max_tokens could interrupt the run. */
+  usageAccounting?: string;
+  /** Secret-shaped strings replaced in `text` before it was returned. */
+  textRedactions?: number;
   /**
    * worker 改动的 unified diff。交叉评审时把它塞给另一家 harness 当输入,
    * 所以放在结果里一步可取,不用去翻事件流。超长会被截断并标注。
@@ -179,7 +208,14 @@ export interface DetectResult {
  */
 export interface EgressReport {
   endpointHost: string;
+  /**
+   * Other hosts the request may go to (e.g. project settings in a sub-directory and at the
+   * repository root disagree, or the login type decides). Policies require all of them to be local.
+   */
+  alternateHosts?: string[];
   nativeAnthropic: boolean;
+  /** Provider / vendor id when known ('anthropic', 'openai', a Codex provider id, …). */
+  vendor?: string;
   /** 端点是从哪读到的,便于用户核对"我到底切了哪一层"。 */
   source: string;
   proxyClues: string[];
@@ -195,7 +231,17 @@ export interface SpawnPlan {
   env?: Record<string, string>;
   /** 会话型协议(层级①)需要能往子进程 stdin 写请求。 */
   needsStdin?: boolean;
+  /** Written to stdin then closed: how the prompt is delivered when the CLI supports it. */
+  stdin?: string;
 }
+
+/**
+ * When an adapter's usage figures arrive:
+ *  - 'streaming': during the run (max_tokens can interrupt it);
+ *  - 'final': only when the run ends (max_tokens can only mark it over budget afterwards);
+ *  - 'none': never (max_tokens cannot be enforced).
+ */
+export type UsageReporting = 'streaming' | 'final' | 'none';
 
 /** 每次任务一个,持有该次运行的解析状态(累积助手文本、用量、结构化结果)。 */
 export interface RunParser {
@@ -243,7 +289,14 @@ export interface Adapter {
    * 用途见 src/egress.ts:同一个 harness id 可能对应原生端点或第三方中转,两者数据去向
    * 和账号风险面完全不同,而用户用 cc-switch 一键就能切换 —— 所以每次派发都要说清。
    */
-  egress?(): Promise<EgressReport>;
+  egress?(spec?: Pick<TaskSpec, 'cwd'>): Promise<EgressReport | undefined>;
+  /**
+   * Credential environment variables this harness legitimately needs (`NAME` or `PREFIX_*`).
+   * Every other credential-looking variable is withheld from the worker (src/env.ts).
+   */
+  credentialEnv?(env: Record<string, string | undefined>): Promise<string[]> | string[];
+  /** Default 'none'. */
+  usageReporting?: UsageReporting;
 }
 
 /** 来自 harness 自身输出的模型清单。`source` 必须能回答"这是哪条命令在什么时候说的"。 */

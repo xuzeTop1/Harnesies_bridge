@@ -8,6 +8,21 @@
 桥就是一个 MCP server,对外只给六个原语,内部把各家的协议差异收敛掉。
 
 规划见 [`PLAN.md`](./PLAN.md),治理与红线见 [`AGENTS.md`](./AGENTS.md)。
+
+> **2026-10 local hardening (this checkout).** Fixes for defects reproduced on macOS, each with a
+> regression test (`test/robustness`, `audit-diff-policy`, `credentials-budget`,
+> `discovery-events-mcp`, opt-in `real-cli-mock`):
+> crash-proof dispatch (oversized prompts, unwritable cwd, parser errors no longer kill the server);
+> prompts delivered on stdin to claude/codex (a prompt starting with `--- a/` used to be parsed as an
+> option); timeout/cancel terminate the whole process tree on POSIX; new `harness_cancel`;
+> disk audit sees rewrites of already-dirty files, files inside untracked directories and ref
+> changes; worktree diffs are taken against the base commit (worker commits were lost);
+> local-only policies apply from sub-directories, worktrees and a user-wide file; credential
+> variables of other vendors are withheld from workers and redaction covers common key names and
+> secret-shaped values; token budgets count cache tokens and stop runs mid-way where the CLI reports
+> usage while running; macOS/Linux CLI discovery (Claude Code's native installer, npm prefixes);
+> paged `harness_events`; machine-independent tests and an `mcp-config` generator instead of
+> `D:\LLMS_Bridge` config files.
 **本机装了哪些版本、哪家能干活、哪家不通 —— 只在 PLAN.md 里带核实日期地记录,本文件不复制**,
 因为这类事实会随版本漂移。
 
@@ -19,28 +34,40 @@
 
 ```bash
 node --version        # 需要 >= 23.6(package.json engines)
-npm test              # 默认套件,**不消耗任何模型额度**
+npm install           # dev-only: typescript + @types/node for `npm run check`; runtime stays dependency-free
+npm run check         # tsc --noEmit
+npm test              # 默认套件,**不消耗任何模型额度**,不依赖本机装了哪些 CLI
+npm run test:machine  # opt-in: assertions about the author's workstation (installed CLIs)
+npm run test:real-cli # opt-in: the real claude CLI against a local mock API (no model, no network)
 npm run test:live     # 只有这条会真派发:需 LLMS_BRIDGE_LIVE=1
 npm run detect        # 列出各家可用性与版本
-npm run dispatch      # 命令行派发一次(调试用;正常入口是 MCP)
+npm run dispatch      # 命令行派发一次(调试用;正常入口是 MCP;Ctrl-C 会结束整棵进程树)
 ```
 
-`npm run check` 想跑 `tsc --noEmit`,但 typescript **不是本仓库依赖**,本机没装就报"找不到命令"。
-这是已知缺口,不是坏了 —— 类型层面目前靠用例与运行时覆盖。
+挂到宿主(**stdio 传输**,不需要任何本地端口)。Machine-specific config files are no longer kept in the
+repository; generate the registration for this checkout instead:
 
-挂到宿主:项目内已有一份 `.mcp.json`(Claude Code / Codex 一类读它),`qoder-mcp-import.json`
-是给 Qoder 导入用的。**stdio 传输**,不需要任何本地端口。
+```bash
+node src/cli.ts mcp-config --host claude   # → claude mcp add --scope user llms-bridge -- <node> <abs path>/src/mcp-server.ts
+node src/cli.ts mcp-config --host codex    # → codex mcp add llms-bridge -- …
+node src/cli.ts mcp-config --host json     # → {"mcpServers": {...}} for Gemini / Qoder / other hosts
+```
 
-## 对外只有六个原语
+CLI discovery: PATH plus common install directories (`~/.local/bin`, `/opt/homebrew/bin`, npm
+prefixes…). Override per harness with `LLMS_BRIDGE_<ID>_CLI=/path` (e.g. `LLMS_BRIDGE_CLAUDE_CLI`)
+or `~/.llms-bridge/config.json` → `{"cli": {"claude": "/path"}}`.
+
+## 对外只有七个原语
 
 | 工具 | 干什么 |
 |---|---|
-| `harness_list` | 有哪些 harness、层级、支持的审批档位、当前可用性与版本 |
+| `harness_list` | 有哪些 harness、层级、支持的审批档位、当前可用性与版本;`usageReporting` says whether max_tokens can stop a run |
 | `harness_models` | 各家**自己声明**的模型清单,带出处与核查时间 |
-| `harness_dispatch` | 派发,**立刻返回 task_id**(不阻塞) |
+| `harness_dispatch` | 派发,**立刻返回 task_id**(不阻塞);ack lists applied policies, withheld credential variable *names* and `max_tokens_enforcement` |
 | `harness_poll` | 轮询:是否结束、状态、事件数、用量 |
-| `harness_result` | 取结构化结果 + worker 的产物 diff |
-| `harness_events` | 归一化事件流,给主脑跟过程 |
+| `harness_result` | 取结构化结果 + worker 的产物 diff(against `base_commit`, worker commits included; capped by `max_diff_bytes`; full patch in `diffPath`) |
+| `harness_events` | 归一化事件流,**分页**:`limit` (≤500), `max_bytes` (≤1 MB), `since_seq` → `next_seq`; raw payloads only with `include_raw` |
+| `harness_cancel` | Cancel a running task: terminates the worker's whole process tree; status `cancelled` |
 
 派发必填 `approval` 与 `max_wall_ms`,**没有默认值**:缺字段就拒绝,不"用缺省"。
 `approval: "full"` 还要显式 `allow_full: true`,否则同样拒绝。
@@ -126,8 +153,15 @@ worktree 的形态由调用方显式选(默认永远是"新建 + 隔离"):
   下写 `cwd` 是你要的行为,不判越界(但 `changed` 照样如实报)。
 - 审计**只报告,不回滚**。它也不覆盖 `.gitignore` 里的路径和仓库外的绝对路径写入 —— 盲区在
   `caveats` 里随结果一起带出,不藏。
+- Method (2026-10): status codes **plus** a size/mtime/ctime fingerprint of every dirty or untracked
+  path (`--untracked-files=all`) **plus** all refs. A rewrite of a file you had already modified,
+  a new file inside an untracked folder, or a new branch/tag are now reported (`change: "content"`,
+  `refsChanged`); the first version reported `changed: false` for the first two.
 
-仓库级"数据能不能出本机"写在 `<仓库>/.llms-bridge/policy.json`(**文件不存在＝不限制**):
+仓库级"数据能不能出本机"写在 `<仓库>/.llms-bridge/policy.json`(**文件不存在＝不限制**)。
+Every applicable file counts and all must allow the dispatch: the cwd and each ancestor
+(`<dir>/.llms-bridge/policy.json`), the main worktree of a linked worktree, and a user-wide
+`~/.llms-bridge/policy.json`. (Before, a sub-directory or worktree cwd silently skipped the repo's policy.)
 
 ```jsonc
 { "cloud": { "allowHarnesses": ["claude"] } }   // 空数组 = 只允许端点在本机的 harness
@@ -163,6 +197,10 @@ ACP 的探测超时算"未判定"而不是"不可用"——会重试一次更宽
 ## 四道闸门
 
 1. **凭证**:桥不读、不存、不转发任何云端厂商密钥,无例外。只复用各家 CLI 自己的登录态。
+   Workers get a filtered environment: each adapter declares its own vendor's credential variables
+   (`credentialEnv`); every other credential-looking variable is withheld (names reported in the ack,
+   never values). Widen explicitly with `LLMS_BRIDGE_PASS_ENV=NAME,PREFIX_*`. Journal files are
+   owner-only (0600/0700) and secret-shaped strings are redacted from stored prompts, events and returned text.
    唯一例外是宿主自己写在配置里的 **localhost 服务 token**,按字段白名单就地只读使用(见 AGENTS.md §1.1)。
 2. **审批**:见上,必填无默认;绕过类档位必须用户当次点名。
    档位还分"拦不拦得住":每个档位随 `supportedApprovals` 一起给 `approvalEnforcement` ——
@@ -177,7 +215,11 @@ ACP 的探测超时算"未判定"而不是"不可用"——会重试一次更宽
    `.scratch/` 是另一回事。清理 worktree 默认是 dry-run,要 `confirm` 才删,且只删桥自己创建的。
    隔离只保证默认落点,**越界由事后审计抓**:见上一节 `diskAudit`。
    仓库级"数据能否出本机"另有一道:见上方 `policy.json`。
-4. **预算**:`max_wall_ms` 到点中断整棵进程树并标 `timeout`;超限不许偷偷换更贵的模型续跑。
+4. **预算**:`max_wall_ms` 到点中断整棵进程树并标 `timeout`(POSIX: the worker runs in its own
+   process group; SIGTERM then SIGKILL to the group; processes that daemonize themselves are out of
+   reach);超限不许偷偷换更贵的模型续跑。`max_tokens` counts cumulative input (cache reads/writes
+   included) + output. It stops the run mid-way for claude/codebuddy/opencode (usage streams), can only
+   be judged afterwards for codex (usage arrives at the end), and is not enforceable for ACP agents.
 
 产物 diff 有上限(`LLMS_BRIDGE_DIFF_CAP`,默认 200KB)。超限时 `diffTruncated: true` ——
 **拿到这个标志就必须改变行为**:半份 diff 换来的评审结论比不评审更糟。
@@ -191,6 +233,11 @@ Anthropic 端点、端点是从哪一层读到的、以及本机代理线索。
 "发给国内中转"变成"发给官方",数据去向和账号风险面全变了。所以:
 
 - 出口报告在派发时**现取**,不复用 `harness_list` 的缓存;
+- Claude Code precedence (measured with the real CLI): `managed > .claude/settings.local.json >
+  .claude/settings.json > user settings > process env`; Bedrock/Vertex switches are honoured; when
+  layers disagree every candidate host is reported (`alternate_hosts`) and policies require all to be local.
+  Codex: read from `config.toml` (`model_provider` / `base_url`); default provider = OpenAI
+  (`api.openai.com` / `chatgpt.com`);
 - 只报主机名,路径段与任何凭证值都不外带(连长度都不印);
 - adapter 没实现 `egress()` 的就是**缺字段**,不替它编一份;
 - 这一报告是**知情用**,不是判定 —— 请求到底走不走某个代理,桥无法验证,判断留给你。

@@ -11,6 +11,7 @@ import type {
 } from '../types.ts';
 import { DispatchRejected } from '../types.ts';
 import { resolveGlobalCli } from '../locate.ts';
+import { argvPrompt } from '../argv.ts';
 import type { ResolvedCli } from '../locate.ts';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -49,9 +50,18 @@ export function createOpencodeAdapter(): Adapter {
      * 标 advisory 而不是把档位摘掉:摘掉等于说"没有只读档可用",而真实情况是"这个标签不解决问题"。
      */
     approvalEnforcement: { 'read-only': 'advisory' },
+    usageReporting: 'streaming',
+    // OpenCode keeps provider credentials in its own auth.json; env keys are not forwarded unless
+    // the user lists them in LLMS_BRIDGE_PASS_ENV.
+    credentialEnv: () => ['OPENCODE_*'],
 
     async detect(): Promise<DetectResult> {
-      entry = await resolveGlobalCli('opencode', 'opencode-ai');
+      try {
+        entry = await resolveGlobalCli('opencode', 'opencode-ai', 'opencode');
+      } catch (err) {
+        entry = null;
+        return { available: false, detail: (err as Error).message };
+      }
       if (!entry) {
         return {
           available: false,
@@ -104,7 +114,7 @@ export function createOpencodeAdapter(): Adapter {
         args.push('--session', spec.session.sessionId);
         if (spec.session.mode === 'fork') args.push('--fork');
       }
-      args.push(spec.prompt);
+      args.push(argvPrompt('opencode', spec.prompt));
       return { command: entry.command, args };
     },
 
@@ -132,19 +142,26 @@ export function createOpencodeAdapter(): Adapter {
           } catch {
             return [];
           }
+          if (obj === null || typeof obj !== 'object') return [];
           if (obj.type === 'text' && typeof obj.part?.text === 'string') {
             text += obj.part.text;
             return [event('message', { text: obj.part.text, raw: obj })];
           }
           if (obj.type === 'step_finish') {
+            // Per-step figures, summed over the run, and attached to the event so the budget gate
+            // sees them while the run is still going (previously they were never on an event).
             const t = obj.part?.tokens;
             if (t) {
+              const read = t.cache?.read ?? 0;
+              const write = t.cache?.write ?? 0;
               usage = {
-                inputTokens: (t.input ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0),
-                outputTokens: t.output ?? 0,
+                inputTokens: (usage?.inputTokens ?? 0) + (t.input ?? 0) + read + write,
+                outputTokens: (usage?.outputTokens ?? 0) + (t.output ?? 0),
+                cacheReadTokens: (usage?.cacheReadTokens ?? 0) + read,
+                cacheWriteTokens: (usage?.cacheWriteTokens ?? 0) + write,
               };
             }
-            return [event('status', { text: `step_finish cost=${obj.part?.cost ?? 0}`, raw: obj })];
+            return [event('status', { text: `step_finish cost=${obj.part?.cost ?? 0}`, raw: obj, ...(usage ? { usage } : {}) })];
           }
           if (obj.type === 'error') {
             // 实测(2026-09-24):`opencode/` 这个 provider 通道 key 无效时,它把

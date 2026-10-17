@@ -3,7 +3,7 @@ import { appendFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { BridgeEvent, TaskSpec, TaskStatus, Tier, Usage } from './types.ts';
-import { redactCredentials } from './redact.ts';
+import { redactCredentials, redactSecretsInText } from './redact.ts';
 import { ensureBridgeDirExcluded } from './worktree.ts';
 
 /**
@@ -31,6 +31,10 @@ const TEXT_CAP = Number(process.env.LLMS_BRIDGE_JOURNAL_CAP ?? 200_000);
  * 索引的落点。**惰性求值**:测试要在 import 之后才把 LLMS_BRIDGE_HOME 指到临时目录,
  * 模块加载时就定死的话,`npm test` 会往用户的真实 `~/.llms-bridge/` 里写垃圾。
  */
+/** Journal files hold prompts, model output and tool results: owner-only on POSIX. */
+const DIR_MODE = 0o700;
+const FILE_MODE = 0o600;
+
 function indexPath(): string {
   const home = process.env.LLMS_BRIDGE_HOME ?? join(homedir(), '.llms-bridge');
   return join(home, 'tasks-index.jsonl');
@@ -57,6 +61,14 @@ export interface TaskRecord {
   status: 'running' | TaskStatus;
   reason?: string;
   usage?: Usage;
+  /** Worktree tasks: the commit the worktree started from; the diff is taken against it. */
+  baseCommit?: string;
+  /** Commits the worker made inside its worktree (`<sha> <subject>`). */
+  workerCommits?: string[];
+  /** Full, unredacted diff on local disk (the MCP response carries a bounded, redacted copy). */
+  diffPath?: string;
+  /** Names (never values) of credential variables withheld from the worker's environment. */
+  envWithheld?: string[];
   prompt?: string;
   promptTruncated?: boolean;
   text?: string;
@@ -81,19 +93,20 @@ function clip(text: string | undefined): { value?: string; truncated?: boolean }
 export function writeTaskRecord(record: TaskRecord): void {
   const dir = join(record.cwd, '.llms-bridge', 'tasks');
   try {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(dir, { recursive: true, mode: DIR_MODE });
   } catch {
     return;
   }
   // 只读任务不分配 worktree,所以不会经过 allocateWorktree 那条 exclude 路径 ——
   // 不在这里补一次,账本就会以未跟踪文件的样子出现在用户的 `git status` 里。
-  ensureBridgeDirExcluded(record.cwd);
+  // Not awaited (this path is synchronous on purpose), so it must not reject unhandled.
+  ensureBridgeDirExcluded(record.cwd).catch(() => {});
 
   // 先写临时文件再改名:崩在写一半会留下坏 JSON,让账本反而变得不可读。
   const target = taskRecordPath(record.cwd, record.taskId);
   const temp = `${target}.tmp`;
   try {
-    writeFileSync(temp, JSON.stringify(record, null, 2), 'utf8');
+    writeFileSync(temp, JSON.stringify(record, null, 2), { encoding: 'utf8', mode: FILE_MODE });
     renameSync(temp, target);
   } catch {
     /* 账本坏了不该拦住派发本身 */
@@ -116,8 +129,10 @@ export function recordDispatch(
   tier: Tier,
   isolated: boolean,
   egressHost?: string,
+  extra: Partial<TaskRecord> = {},
 ): void {
-  const prompt = clip(spec.prompt);
+  // The prompt is the caller's text; a key pasted into it should not sit on disk in clear.
+  const prompt = clip(redactSecretsInText(spec.prompt).text);
   const record: TaskRecord = {
     taskId: spec.taskId,
     harness: spec.harness,
@@ -128,13 +143,14 @@ export function recordDispatch(
     requestedCwd: spec.cwd,
     cwd: runCwd,
     isolated,
-    worktreePath: isolated ? runCwd : undefined,
+    worktreePath: isolated ? runCwd : undefined, // overridden by extra.worktreePath when known
     startedAt: Date.now(),
     status: 'running',
     prompt: prompt.value,
     promptTruncated: prompt.truncated,
     // 记下这次数据发往哪个主机:事后审计"这批内容出过本机没有"时,这是唯一的落盘依据。
     egressHost,
+    ...extra,
   };
   writeTaskRecord(record);
   void appendIndex(record);
@@ -144,17 +160,17 @@ export function recordDispatch(
 export function recordFinish(
   runCwd: string,
   taskId: string,
-  patch: Pick<TaskRecord, 'status' | 'reason' | 'usage'> & { text?: string },
+  patch: Pick<TaskRecord, 'status' | 'reason' | 'usage'> &
+    Partial<Pick<TaskRecord, 'baseCommit' | 'workerCommits' | 'diffPath'>> & { text?: string },
 ): void {
   const existing = readTaskRecord(runCwd, taskId);
   if (existing === null) return;
-  const text = clip(patch.text);
+  const { text: rawText, ...rest } = patch;
+  const text = clip(rawText === undefined ? undefined : redactSecretsInText(rawText).text);
   writeTaskRecord({
     ...existing,
+    ...rest,
     endedAt: Date.now(),
-    status: patch.status,
-    reason: patch.reason,
-    usage: patch.usage,
     text: text.value,
     textTruncated: text.truncated,
   });
@@ -163,7 +179,7 @@ export function recordFinish(
 async function appendIndex(record: TaskRecord): Promise<void> {
   const path = indexPath();
   try {
-    mkdirSync(dirname(path), { recursive: true });
+    mkdirSync(dirname(path), { recursive: true, mode: DIR_MODE });
     await appendFile(
       indexPath(),
       JSON.stringify({
@@ -172,7 +188,7 @@ async function appendIndex(record: TaskRecord): Promise<void> {
         cwd: record.cwd,
         startedAt: record.startedAt,
       }) + '\n',
-      'utf8',
+      { encoding: 'utf8', mode: FILE_MODE },
     );
   } catch {
     /* 索引写不进去只影响"事后能不能反查",不该让派发失败 */
@@ -249,10 +265,10 @@ export function readTaskBeat(cwd: string, taskId: string): TaskBeat | null {
 export function writeTaskBeat(cwd: string, beat: TaskBeat): void {
   const dir = join(cwd, '.llms-bridge', 'tasks');
   try {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(dir, { recursive: true, mode: DIR_MODE });
     const target = beatPath(cwd, beat.taskId);
     const temp = `${target}.tmp`;
-    writeFileSync(temp, JSON.stringify(beat), 'utf8');
+    writeFileSync(temp, JSON.stringify(beat), { encoding: 'utf8', mode: FILE_MODE });
     renameSync(temp, target);
   } catch {
     /* 心跳写不进去只影响面板看不看得到,不该影响任务本身 */
@@ -533,7 +549,7 @@ function toLogLine(event: BridgeEvent): EventLogLine {
   const line: EventLogLine = { seq: event.seq, type: event.type, at: event.at };
   let clipped = false;
   if (event.text !== undefined) {
-    const c = clipField(event.text);
+    const c = clipField(redactSecretsInText(event.text).text);
     line.text = c.value;
     clipped = c.clipped === true;
   }
@@ -559,39 +575,41 @@ function toLogLine(event: BridgeEvent): EventLogLine {
   return line;
 }
 
-/** 追加一行事件。写不进去只影响面板能不能看到过程,绝不该影响任务本身。 */
+/**
+ * 追加一行事件。写不进去只影响面板能不能看到过程,绝不该影响任务本身.
+ *
+ * Everything is inside one try: this runs inside the worker's stdout handler, and an exception
+ * there (EACCES on mkdir when the task cwd is not writable, ENOSPC, …) used to be an uncaught
+ * exception that killed the whole bridge process.
+ */
 export function appendEvent(cwd: string, event: BridgeEvent): void {
-  const path = eventLogPath(cwd, event.taskId);
-  let st = written.get(path);
-  if (st === undefined) {
-    st = { bytes: statSync(path, { throwIfNoEntry: false })?.size ?? 0, capped: false };
-    written.set(path, st);
-    mkdirSync(dirname(path), { recursive: true });
-  }
-  if (st.capped) return;
-
-  const encoded = `${JSON.stringify(toLogLine(event))}\n`;
-  if (st.bytes + Buffer.byteLength(encoded, 'utf8') > EVENT_BYTES_CAP) {
-    st.capped = true;
-    const marker: EventLogLine = {
-      seq: -1,
-      type: 'status',
-      at: Date.now(),
-      marker: 'bytes-cap',
-      text: `事件流已达 ${EVENT_BYTES_CAP} 字节上限,此后的事件未落盘 —— 面板上"落盘 N 条"与"共 M 条"对不上就是这个原因`,
-    };
-    try {
-      appendFileSync(path, `${JSON.stringify(marker)}\n`, 'utf8');
-    } catch {
-      /* 标记也写不进就是盘有问题,此时面板会显示两数不等,而不会误显示成"事件都在这" */
-    }
-    return;
-  }
   try {
-    appendFileSync(path, encoded, 'utf8');
+    const path = eventLogPath(cwd, event.taskId);
+    let st = written.get(path);
+    if (st === undefined) {
+      st = { bytes: statSync(path, { throwIfNoEntry: false })?.size ?? 0, capped: false };
+      written.set(path, st);
+      mkdirSync(dirname(path), { recursive: true, mode: DIR_MODE });
+    }
+    if (st.capped) return;
+
+    const encoded = `${JSON.stringify(toLogLine(event))}\n`;
+    if (st.bytes + Buffer.byteLength(encoded, 'utf8') > EVENT_BYTES_CAP) {
+      st.capped = true;
+      const marker: EventLogLine = {
+        seq: -1,
+        type: 'status',
+        at: Date.now(),
+        marker: 'bytes-cap',
+        text: `事件流已达 ${EVENT_BYTES_CAP} 字节上限,此后的事件未落盘 —— 面板上"落盘 N 条"与"共 M 条"对不上就是这个原因`,
+      };
+      appendFileSync(path, `${JSON.stringify(marker)}\n`, { encoding: 'utf8', mode: FILE_MODE });
+      return;
+    }
+    appendFileSync(path, encoded, { encoding: 'utf8', mode: FILE_MODE });
     st.bytes += Buffer.byteLength(encoded, 'utf8');
   } catch {
-    /* 见上 */
+    /* 见上:盘有问题时面板会显示两数不等,而不会误显示成"事件都在这" */
   }
 }
 

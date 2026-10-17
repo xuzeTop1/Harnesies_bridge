@@ -804,6 +804,24 @@ db 是 **protobuf 字节数组**(`steps`/`gen_metadata`),扫可读 ASCII 只找�
 - ~~MiMo 要配哪种模型才能产出文本~~ → 根因是**根本没配**:`~/.config/mimocode/mimocode.jsonc`
   只有一行 `$schema`,没有任何 provider/model。用 `-m provider/model` 或在配置里加 provider。
 
+### 8.2c 2026-10-16 local hardening (macOS): verified / not verified
+
+Verified (each has a regression test or a re-runnable measurement):
+- A single task can no longer crash the server: 1.2 MB prompt (`spawn E2BIG`), unwritable read-only cwd (EACCES), parser exceptions.
+- claude / codex prompts go through stdin: the real claude 2.1.302 against a local mock API received the
+  prompt verbatim (including a leading `--- a/`); a codex 0.160.1 smoke test confirmed `-` reads stdin
+  instead of failing with "unexpected argument".
+- POSIX timeout/cancel end the whole process group: a 1 s budget ends at 1.0 s (was 8.0 s with the grandchild still running).
+- Audit, worktree diffs with worker commits, policy scope, redaction, environment filtering, budget accounting: see test/*.test.mjs.
+- Discovery: `detect` on this Mac now reports claude (native installer) and codex (before: codex only).
+
+Not verified (could not be checked on this machine — do not treat as verified):
+- codebuddy / opencode are not installed here; their argv guards ("-" prefix, size limit) were tested with fake CLIs only.
+- codex end-to-end against a mock model: codex 0.160 uses the websocket Responses API and ignores
+  `OPENAI_BASE_URL`, so no mock was built; only stdin acceptance and JSON event parsing (fake codex) were tested.
+- Windows: process-tree kill is still `taskkill /T /F` (unchanged, not re-tested); path canonicalisation not re-tested on Windows.
+- The Claude managed-settings layer follows the documented priority; not measured.
+
 ### 8.3 未实现(不要按文档当成已有)
 
 1. **按能力标签自动选人**。`TaskSpec` **没有** `capabilities` 字段,调度器也不做能力匹配 ——

@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { resolve } from 'node:path';
+import { existsSync, realpathSync } from 'node:fs';
+import { delimiter, dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Scheduler } from './scheduler.ts';
 import { createAdapters } from './registry.ts';
 import { cleanBridgeWorktrees, isGitRepo, listWorktrees } from './worktree.ts';
@@ -55,7 +57,53 @@ const USAGE = `llms-bridge(冒烟入口)
       并写进 ~/.llms-bridge/ui.json 供事后找回。Ctrl-C 退出。
       它没有任何派发/取消接口 —— 控制面仍然只有 MCP 那六个原语。
 
+  node src/cli.ts mcp-config [--host claude|codex|gemini|json]
+      Print the MCP registration for THIS checkout (absolute paths of this machine), e.g.
+      claude mcp add --scope user llms-bridge -- <node> <path>/src/mcp-server.ts
+
   approval 取值: read-only | workspace-write | full(full 需 --allow-full)`;
+
+/** Absolute path of this checkout's MCP entry point; replaces the hard-coded D:\\LLMS_Bridge configs. */
+function serverEntry(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), 'mcp-server.ts');
+}
+
+/**
+ * The node to register: a PATH entry that resolves to this very binary is preferred, because
+ * process.execPath can be a versioned location (Homebrew's Cellar/node/<version>) that disappears
+ * on the next upgrade.
+ */
+function stableNode(): string {
+  const real = (p: string) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
+  const self = real(process.execPath);
+  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
+    const candidate = join(dir, process.platform === 'win32' ? 'node.exe' : 'node');
+    if (dir && existsSync(candidate) && real(candidate) === self) return candidate;
+  }
+  return process.execPath;
+}
+
+function mcpConfig(host: string): string {
+  const node = stableNode();
+  const entry = serverEntry();
+  const json = JSON.stringify({ mcpServers: { 'llms-bridge': { command: node, args: [entry] } } }, null, 2);
+  switch (host) {
+    case 'claude':
+      return `claude mcp add --scope user llms-bridge -- ${JSON.stringify(node)} ${JSON.stringify(entry)}`;
+    case 'codex':
+      return `codex mcp add llms-bridge -- ${JSON.stringify(node)} ${JSON.stringify(entry)}`;
+    case 'gemini':
+    case 'json':
+    default:
+      return json;
+  }
+}
 
 async function main(): Promise<number> {
   const argv = process.argv.slice(2);
@@ -66,8 +114,12 @@ async function main(): Promise<number> {
     return 0;
   }
 
-  const scheduler = new Scheduler(createAdapters());
   const flags = parseFlags(argv.slice(1));
+  if (command === 'mcp-config') {
+    console.log(mcpConfig(str(flags, 'host') ?? 'json'));
+    return 0;
+  }
+  const scheduler = new Scheduler(createAdapters());
 
   if (command === 'detect') {
     const report = await scheduler.detectAll();
@@ -157,6 +209,11 @@ async function main(): Promise<number> {
     try {
       // detect 由 dispatch 在参数校验之后自行触发,这里不用先跑
       const ack = await scheduler.dispatch(spec);
+      // Ctrl-C stops the worker's whole process tree instead of leaving it running.
+      process.once('SIGINT', () => {
+        console.error('[cancel] SIGINT: stopping the worker');
+        scheduler.cancel(ack.taskId, 'SIGINT from the CLI');
+      });
       console.error(
         `[dispatched] task=${ack.taskId} harness=${harness} approval=${approval} ` +
           `isolated=${ack.isolated}${ack.worktreePath ? ` worktree=${ack.worktreePath}` : ''}`,

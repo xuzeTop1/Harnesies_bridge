@@ -1,3 +1,0 @@
-[mcp_servers.llms-bridge]
-command = "node"
-args = ['D:\LLMS_Bridge\src\mcp-server.ts']

@@ -12,7 +12,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, realpath, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, normalize, sep } from 'node:path';
@@ -28,7 +28,7 @@ import {
 const git = (cwd, args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
 
 async function makeRepo() {
-  const dir = await mkdtemp(join(tmpdir(), 'llms-bridge-wt-'));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'llms-bridge-wt-')));
   git(dir, ['init', '-q']);
   await writeFile(join(dir, 'README.md'), 'hello\n', 'utf8');
   git(dir, ['add', '-A']);
@@ -38,7 +38,7 @@ async function makeRepo() {
 
 test('isGitRepo 区分 git 仓库与普通目录', async () => {
   const repo = await makeRepo();
-  const plain = await mkdtemp(join(tmpdir(), 'llms-bridge-plain-'));
+  const plain = await realpath(await mkdtemp(join(tmpdir(), 'llms-bridge-plain-')));
   try {
     assert.equal(await isGitRepo(repo), true);
     assert.equal(await isGitRepo(plain), false);
@@ -125,7 +125,8 @@ test('worktree 是 --detach,不污染分支列表', async () => {
   try {
     await allocateWorktree(repo, 'task-detach');
     const branches = git(repo, ['branch', '--format=%(refname:short)']).trim().split('\n');
-    assert.deepEqual(branches, ['master'], `不应新增分支,实际 ${branches.join(',')}`);
+    const initial = git(repo, ['symbolic-ref', '--short', 'HEAD']).trim();
+    assert.deepEqual(branches, [initial], `不应新增分支,实际 ${branches.join(',')}`);
     assert.match(git(repo, ['worktree', 'list']), /detached HEAD/, 'worktree 应是 detached HEAD');
     // 确认 stat 已导入但未使用被 tsc 提醒前,这里用一下避免 lint 噪音
     assert.ok((await stat(repo)).isDirectory());

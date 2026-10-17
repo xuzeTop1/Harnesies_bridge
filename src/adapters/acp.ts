@@ -409,6 +409,8 @@ function createRun(spec: TaskSpec, taskId: string, harness: string): RunParser {
       } catch {
         return [event('message', { text: line, raw: line })];
       }
+      // `null` / numbers are valid JSON; property access on them used to throw inside the stdout handler.
+      if (msg === null || typeof msg !== 'object') return [event('message', { text: line, raw: line })];
 
       // 代理反向发起的请求:必须应答,否则对方会一直等。
       if (msg.id !== undefined && typeof msg.method === 'string') {
@@ -551,6 +553,8 @@ export interface AcpAdapterConfig {
    * Gemini / Qwen 是 flag `--acp`;MiMo / OpenClaw 是子命令 `acp`。
    */
   acpArgs?: string[];
+  /** Credential env vars this agent may receive (`NAME` / `PREFIX_*`); default `<ID>_*`. */
+  credentialEnv?: string[];
 }
 
 export function createAcpAdapter(config: AcpAdapterConfig): Adapter {
@@ -565,9 +569,17 @@ export function createAcpAdapter(config: AcpAdapterConfig): Adapter {
     supportedApprovals: ACP_WRITE_APPROVALS_WIRED
       ? ['read-only', 'workspace-write', 'full']
       : ['read-only'],
+    // ACP has no standard usage notification; max_tokens cannot be enforced for these agents.
+    usageReporting: 'none',
+    credentialEnv: () => config.credentialEnv ?? [`${config.id.toUpperCase()}_*`],
 
     async detect(): Promise<DetectResult> {
-      cli = await resolveGlobalCli(config.binName, config.pkgName);
+      try {
+        cli = await resolveGlobalCli(config.binName, config.pkgName, config.id);
+      } catch (err) {
+        cli = null;
+        return { available: false, detail: (err as Error).message };
+      }
       if (!cli) {
         return { available: false, detail: `找不到 ${config.binName}(${config.pkgName})的 bin` };
       }

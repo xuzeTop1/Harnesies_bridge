@@ -17,6 +17,13 @@ process.env.LLMS_BRIDGE_HOME = join(tmpdir(), `llms-bridge-test-home-${process.p
 
 const adapters = createAdapters();
 
+/**
+ * Tests that assert what is installed on the author's workstation (which CLIs, which bundle).
+ * They are opt-in so `npm test` is portable; run them with LLMS_BRIDGE_MACHINE=1 where they apply.
+ */
+const MACHINE =
+  process.env.LLMS_BRIDGE_MACHINE === '1' ? false : 'machine-specific: set LLMS_BRIDGE_MACHINE=1 on a workstation that has these CLIs';
+
 test('注册表里每个 adapter 都满足统一契约', () => {
   assert.ok(adapters.length >= 4, `adapter 数应 >= 4,实际 ${adapters.length}`);
 
@@ -94,7 +101,7 @@ test('detect() 返回结构正确,且不把"装了但不可用"报成可用', as
   }
 });
 
-test('A 股本机实测基线:codex 必须可用(三家可产出文本之一,见 PLAN §3.5)', async () => {
+test('A 股本机实测基线:codex 必须可用(三家可产出文本之一,见 PLAN §3.5)', { skip: MACHINE }, async () => {
   const codex = adapters.find((a) => a.id === 'codex');
   assert.ok(codex, '注册表里应有 codex');
   const d = await codex.detect();
@@ -317,7 +324,7 @@ test('调度器真的会拒绝层级① 的写任务', async () => {
 
 // —— CodeBuddy(腾讯,层级②)—— 本机第二个真正能产出文本的 harness ——
 
-test('codebuddy 已入列,未给覆盖时默认解析到 WorkBuddy 捆绑的那份 CLI', async () => {
+test('codebuddy 已入列,未给覆盖时默认解析到 WorkBuddy 捆绑的那份 CLI', { skip: MACHINE }, async () => {
   const cb = adapters.find((a) => a.id === 'codebuddy');
   assert.ok(cb, '注册表里应有 codebuddy');
   assert.equal(cb.tier, 2, 'codebuddy 与 Claude Code 同构,属层级②');
@@ -397,7 +404,7 @@ test('codebuddy:覆盖指向不存在的路径时明确失败,绝不静默退回
   assert.match(d.detail, /不会.*悄悄退回|不会悄悄退回|不.*悄悄退回/, '失败原因要指路');
 });
 
-test('codebuddy:npm .cmd shim 解析出真实 js 入口,不过 shell', async () => {
+test('codebuddy:npm .cmd shim 解析出真实 js 入口,不过 shell', { skip: process.platform === 'win32' ? false : 'Windows npm .cmd shims only' }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'llms-cb-shim-'));
   const entryDir = join(dir, 'node_modules', 'fake-pkg', 'bin');
   mkdirSync(entryDir, { recursive: true });
@@ -435,8 +442,12 @@ test('codebuddy:npm .cmd shim 解析出真实 js 入口,不过 shell', async () 
   assert.equal(plan.args[plan.args.length - 1], '带 & 和 | 的 prompt "引号" 以及中文');
 });
 
-test('codebuddy 的 argv 构造符合实测的旗标', () => {
-  const cb = adapters.find((a) => a.id === 'codebuddy');
+test('codebuddy 的 argv 构造符合实测的旗标', async () => {
+  const { createCodeBuddyAdapter } = await import('../src/adapters/codebuddy.ts');
+  const dir = mkdtempSync(join(tmpdir(), 'llms-cb-argv-'));
+  const cli = fakeCli(dir, '#!/usr/bin/env node\nprocess.stdout.write("fake-codebuddy 9.9.9\\n");\n', 'fake-codebuddy.mjs');
+  const cb = createCodeBuddyAdapter({ env: { LLMS_BRIDGE_CODEBUDDY_CLI: cli, LLMS_BRIDGE_HOME: dir } });
+  assert.equal((await cb.detect()).available, true);
   const base = {
     taskId: 't',
     harness: 'codebuddy',
@@ -460,6 +471,9 @@ test('codebuddy 的 argv 构造符合实测的旗标', () => {
 
   // prompt 必须是最后一个位置参数,否则会被当成旗标值
   assert.equal(ro.args[ro.args.length - 1], 'x');
+  // A prompt that starts with "-" (a pasted diff) must not be parsed as an option.
+  const diffy = cb.plan({ ...base, approval: 'read-only', prompt: '--- a/x\n+++ b/x' });
+  assert.equal(diffy.args[diffy.args.length - 1], '\n--- a/x\n+++ b/x');
 });
 
 // —— 模型清单(harness_models 的数据源)——
@@ -498,7 +512,17 @@ test('models():自报的给清单;不自报的必须 declared:false + 空清单 
   assert.match(q.source, /未知|不要填/, '未声明时要给出可读的原因,而不是留空让人误解为"没有模型"');
 });
 
-test('codebuddy 确实能自报清单(锚点断言,避免随版本漂移而误红)', async () => {  const cb = adapters.find((a) => a.id === 'codebuddy');
+test('codebuddy 确实能自报清单(锚点断言,避免随版本漂移而误红)', async () => {
+  const { createCodeBuddyAdapter } = await import('../src/adapters/codebuddy.ts');
+  const dir = mkdtempSync(join(tmpdir(), 'llms-cb-models-'));
+  const help = 'Usage: codebuddy [options]\\n  --model <model>  Model to use. Currently supported: (auto, deepseek-v3.1,\\n    gpt-5, claude-sonnet)\\n';
+  const cli = fakeCli(
+    dir,
+    `#!/usr/bin/env node\nconst a = process.argv[2];\nprocess.stdout.write(a === '--help' ? '${help}' : 'fake-codebuddy 9.9.9\\n');\n`,
+    'fake-codebuddy.mjs',
+  );
+  const cb = createCodeBuddyAdapter({ env: { LLMS_BRIDGE_CODEBUDDY_CLI: cli, LLMS_BRIDGE_HOME: dir } });
+  assert.equal((await cb.detect()).available, true);
   const catalog = await cb.listModels();
   assert.ok(catalog, 'codebuddy 的 --help 里有 "Currently supported: (...)",应能解析出来');
   assert.ok(catalog.models.includes('auto'), 'auto 是它列表里的第一项,用户要的"AUTO 默认"是原生取值');
@@ -542,7 +566,16 @@ test('opencode 的 plan():read-only 可构造且不出现 --auto;其它档位当
   // 未探测就 plan() 必须拒绝,而不是给一条坏命令
   assert.throws(() => oc.plan({ ...base, approval: 'read-only' }), /未探测/);
 
-  assert.equal((await oc.detect()).available, true, '本机应能探测到 opencode');
+  const dir = mkdtempSync(join(tmpdir(), 'llms-oc-'));
+  const cli = fakeCli(dir, '#!/usr/bin/env node\nprocess.stdout.write("1.99.0\\n");\n', 'fake-opencode.mjs');
+  const prev = process.env.LLMS_BRIDGE_OPENCODE_CLI;
+  process.env.LLMS_BRIDGE_OPENCODE_CLI = cli;
+  try {
+    assert.equal((await oc.detect()).available, true, '覆盖路径上的 opencode 应能探测到');
+  } finally {
+    if (prev === undefined) delete process.env.LLMS_BRIDGE_OPENCODE_CLI;
+    else process.env.LLMS_BRIDGE_OPENCODE_CLI = prev;
+  }
   const plan = oc.plan({ ...base, approval: 'read-only', model: 'opencode/big-pickle' });
   assert.ok(plan.args.includes('run'), '应走一次性 run');
   assert.equal(at(plan.args, '--format'), 'json', '必须要求 JSON 事件输出,否则没法解析');
@@ -587,7 +620,7 @@ test('opencode 的解析器:text 累积、step_finish 折算 usage(含缓存 tok
   assert.equal(fin.text, 'hello', '多段 text 要累积成完整答案');
   assert.deepEqual(
     fin.usage,
-    { inputTokens: 153, outputTokens: 7 },
+    { inputTokens: 153, outputTokens: 7, cacheReadTokens: 50, cacheWriteTokens: 3 },
     'input 必须把缓存读/写算进去,否则成本被低估',
   );
 });

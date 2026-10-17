@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -42,7 +42,7 @@ function makeStub(seen) {
 }
 
 async function makeRepo() {
-  const dir = await mkdtemp(join(tmpdir(), 'llms-bridge-wtmode-'));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'llms-bridge-wtmode-')));
   git(dir, ['init', '-q']);
   await writeFile(join(dir, 'marker.txt'), 'MAIN\n', 'utf8');
   git(dir, ['add', '-A']);

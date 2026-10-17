@@ -8,10 +8,17 @@
     "node": ">=23.6"
   },
   "scripts": {
-    "check": "tsc --noEmit",
-    "test": "node --test",
-    "test:live": "node --test --test-name-pattern=真实派发",
+    "check": "tsc --noEmit -p .",
+    "test": "node --test \"test/*.test.mjs\"",
+    "test:live": "node --test --test-name-pattern=真实派发 \"test/*.test.mjs\"",
     "detect": "node src/cli.ts detect",
-    "dispatch": "node src/cli.ts dispatch"
+    "dispatch": "node src/cli.ts dispatch",
+    "test:machine": "node scripts/test-env.mjs LLMS_BRIDGE_MACHINE=1 -- \"test/*.test.mjs\"",
+    "test:real-cli": "node scripts/test-env.mjs LLMS_BRIDGE_REAL_CLI=1 -- test/real-cli-mock.test.mjs",
+    "mcp-config": "node src/cli.ts mcp-config"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "^5.9.3"
   }
 }

@@ -12,7 +12,9 @@ import type {
   Usage,
 } from '../types.ts';
 import { DispatchRejected } from '../types.ts';
-import { resolveCodex } from '../locate.ts';
+import { invocationFor, resolveCodex } from '../locate.ts';
+import type { ResolvedCli } from '../locate.ts';
+import { codexEgress, readCodexConfig } from '../egress.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -41,6 +43,7 @@ const SANDBOX: Record<ApprovalLevel, string> = {
 function createRun(spec: TaskSpec, taskId: string): RunParser {
   let seq = 0;
   let lastAgentText: string | undefined;
+  /** Cumulative over turn.completed lines (one per `exec` turn). */
   let usage: Usage | undefined;
   let threadId: string | undefined;
   const errorTexts: string[] = [];
@@ -64,17 +67,22 @@ function createRun(spec: TaskSpec, taskId: string): RunParser {
         return [event('message', { text: line, raw: line })];
       }
 
-      switch (obj?.type) {
+      if (obj === null || typeof obj !== 'object') return [event('message', { text: line, raw: line })];
+      switch (obj.type) {
         case 'thread.started':
           threadId = obj.thread_id;
           return [event('status', { text: `thread.started ${String(obj.thread_id)}`, raw: obj })];
         case 'turn.started':
           return [event('status', { text: 'turn.started', raw: obj })];
         case 'turn.completed': {
+          // OpenAI semantics: input_tokens already includes cached_input_tokens and output_tokens
+          // includes reasoning tokens, so they are not added again.
           const u = obj.usage ?? {};
+          const num = (v: unknown) => (typeof v === 'number' ? v : 0);
           usage = {
-            inputTokens: typeof u.input_tokens === 'number' ? u.input_tokens : undefined,
-            outputTokens: typeof u.output_tokens === 'number' ? u.output_tokens : undefined,
+            inputTokens: (usage?.inputTokens ?? 0) + num(u.input_tokens),
+            outputTokens: (usage?.outputTokens ?? 0) + num(u.output_tokens),
+            cacheReadTokens: (usage?.cacheReadTokens ?? 0) + num(u.cached_input_tokens),
           };
           return [event('usage', { usage, raw: obj })];
         }
@@ -135,35 +143,55 @@ function createRun(spec: TaskSpec, taskId: string): RunParser {
 }
 
 export function createCodexAdapter(): Adapter {
-  let binary: string | null = null;
+  let cli: ResolvedCli | null = null;
 
   return {
     id: 'codex',
     tier: 3,
     displayName: 'Codex CLI',
     supportedApprovals: ['read-only', 'workspace-write', 'full'],
+    // `codex exec --json` reports usage in turn.completed, i.e. when the run is over.
+    usageReporting: 'final',
 
     async detect(): Promise<DetectResult> {
-      binary = await resolveCodex();
-      if (!binary) {
-        return { available: false, detail: 'codex.exe 不在 %LOCALAPPDATA%\\OpenAI\\Codex\\bin\\ 也不在 PATH' };
-      }
+      let binary: string | null;
       try {
-        const { stdout } = await execFileAsync(binary, ['--version'], { timeout: 20_000, windowsHide: true });
-        return { available: true, version: stdout.trim() };
+        binary = await resolveCodex();
+      } catch (err) {
+        cli = null;
+        return { available: false, detail: (err as Error).message };
+      }
+      if (!binary) {
+        return { available: false, detail: 'codex 不在 PATH / 常见安装目录 / %LOCALAPPDATA%\\OpenAI\\Codex\\bin;可用 LLMS_BRIDGE_CODEX_CLI 指定' };
+      }
+      cli = invocationFor(binary, binary);
+      try {
+        const { stdout } = await execFileAsync(cli.command, [...cli.prefixArgs, '--version'], { timeout: 20_000, windowsHide: true });
+        return { available: true, version: `${stdout.trim()} | ${cli.detail}` };
       } catch (err) {
         return { available: false, detail: `--version 失败: ${(err as Error).message}` };
       }
     },
 
+    async egress() {
+      return codexEgress();
+    },
+
+    async credentialEnv(env) {
+      // Its own vendor's variables plus whatever env_key its config.toml providers name.
+      const cfg = await readCodexConfig(env);
+      return ['OPENAI_*', 'CODEX_*', 'AZURE_OPENAI_*', ...(cfg?.envKeys ?? [])];
+    },
+
     plan(spec: TaskSpec): SpawnPlan {
-      if (!binary) throw new DispatchRejected('codex: 未探测成功,先调用 detect()');
+      if (!cli) throw new DispatchRejected('codex: 未探测成功,先调用 detect()');
       const sessionArgs =
         spec.session.mode === 'fresh'
           ? ['exec']
           : ['exec', spec.session.mode, spec.session.sessionId];
 
       const args = [
+        ...cli.prefixArgs,
         ...sessionArgs,
         '--json',
         '-C',
@@ -174,9 +202,11 @@ export function createCodexAdapter(): Adapter {
       ];
       if (spec.outputSchemaPath) args.push('--output-schema', spec.outputSchemaPath);
       if (spec.model) args.push('-m', spec.model);
-      args.push(spec.prompt);
+      // `-` = read the prompt from stdin (codex exec --help; verified 2026-10-16 that a prompt
+      // starting with "--- a/" is accepted this way, while as an argument it is "unexpected").
+      args.push('-');
 
-      return { command: binary, args };
+      return { command: cli.command, args, stdin: spec.prompt };
     },
 
     createRun,

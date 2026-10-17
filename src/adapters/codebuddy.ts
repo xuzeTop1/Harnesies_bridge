@@ -17,6 +17,8 @@ import type {
 } from '../types.ts';
 import { DispatchRejected } from '../types.ts';
 import { localAppData, which } from '../locate.ts';
+import { argvPrompt } from '../argv.ts';
+import { createClaudeStreamRun } from './claude.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -41,96 +43,9 @@ const PERMISSION_MODE: Record<ApprovalLevel, string> = {
   full: 'bypassPermissions',
 };
 
+/** Same stream-json shape as Claude Code (incl. `thinking` blocks), so the same parser and usage accounting. */
 function createRun(spec: TaskSpec, taskId: string): RunParser {
-  let seq = 0;
-  let lastResultText: string | undefined;
-  let accumulated = '';
-  let usage: Usage | undefined;
-  let fatal: string | undefined;
-  let isError = false;
-
-  const event = (type: EventType, extra: Partial<BridgeEvent> = {}): BridgeEvent => ({
-    taskId,
-    seq: seq++,
-    harness: 'codebuddy',
-    tier: 2,
-    type,
-    at: Date.now(),
-    ...extra,
-  });
-
-  return {
-    parseLine(line: string): BridgeEvent[] {
-      let obj: any;
-      try {
-        obj = JSON.parse(line);
-      } catch {
-        return [event('message', { text: line, raw: line })];
-      }
-
-      switch (obj?.type) {
-        case 'system':
-          if (obj.subtype === 'init') {
-            return [
-              event('status', {
-                text: 'init model=' + String(obj.model) + ' key=' + String(obj.apiKeySource),
-                raw: obj,
-              }),
-            ];
-          }
-          return [event('status', { text: 'system:' + String(obj.subtype), raw: obj })];
-        case 'assistant': {
-          const blocks: any[] = Array.isArray(obj.message?.content) ? obj.message.content : [];
-          const out: BridgeEvent[] = [];
-          for (const block of blocks) {
-            if (block?.type === 'text' && typeof block.text === 'string') {
-              accumulated += block.text;
-              out.push(event('message', { text: block.text, raw: obj }));
-            } else if (block?.type === 'thinking') {
-              out.push(event('status', { text: '<thinking>', raw: block }));
-            } else if (block?.type === 'tool_use') {
-              out.push(event('tool_call', { text: String(block.name ?? ''), raw: block }));
-            } else if (block?.type === 'tool_result') {
-              out.push(event('tool_result', { raw: block }));
-            } else {
-              out.push(event('status', { text: 'assistant.block=' + String(block?.type), raw: block }));
-            }
-          }
-          const u = obj.message?.usage;
-          if (u && typeof u.input_tokens === 'number') {
-            usage = { inputTokens: u.input_tokens, outputTokens: u.output_tokens };
-          }
-          return out.length > 0 ? out : [event('status', { text: 'assistant(empty)', raw: obj })];
-        }
-        case 'result': {
-          isError = obj.is_error === true;
-          if (typeof obj.result === 'string') lastResultText = obj.result;
-          const u = obj.usage;
-          if (u && typeof u.input_tokens === 'number') {
-            usage = { inputTokens: u.input_tokens, outputTokens: u.output_tokens };
-          }
-          if (isError) fatal = typeof obj.result === 'string' ? obj.result : 'codebuddy 报告 is_error';
-          return [event('result', { text: lastResultText, usage, raw: obj })];
-        }
-        default:
-          return [event('status', { text: 'codebuddy:' + String(obj?.type), raw: obj })];
-      }
-    },
-
-    finalize(exitCode: number) {
-      const text = lastResultText ?? (accumulated.length > 0 ? accumulated : undefined);
-      return {
-        text,
-        structured: undefined,
-        usage,
-        errorText: isError
-          ? (fatal ?? 'codebuddy 报告 is_error')
-          : exitCode === 0
-            ? undefined
-            : 'exit ' + exitCode,
-      };
-    },
-  };
+  return createClaudeStreamRun('codebuddy', spec, taskId);
 }
 
 /** WorkBuddy 捆绑的 CLI 路径。装在应用目录里、随应用升级变动,故动态拼而不写死版本。 */
@@ -244,6 +159,8 @@ export function createCodeBuddyAdapter(opts: CodeBuddyAdapterOptions = {}): Adap
     tier: 2,
     displayName: 'CodeBuddy(腾讯)',
     supportedApprovals: ['read-only', 'workspace-write', 'full'],
+    usageReporting: 'streaming',
+    credentialEnv: () => ['CODEBUDDY_*'],
 
     async detect(): Promise<DetectResult> {
       let override: { path: string; whence: string } | null = null;
@@ -311,7 +228,7 @@ export function createCodeBuddyAdapter(opts: CodeBuddyAdapterOptions = {}): Adap
         const flat = stdout.replace(/\s+/g, ' ');
         const m = /Currently supported:\s*\(([^)]+)\)/.exec(flat);
         if (!m) return null;
-        const models = m[1]
+        const models = (m[1] ?? '')
           .split(',')
           .map((s) => s.trim())
           .filter((s) => s.length > 0);
@@ -335,7 +252,11 @@ export function createCodeBuddyAdapter(opts: CodeBuddyAdapterOptions = {}): Adap
       ];
       if (spec.model) args.push('--model', spec.model);
       if (spec.session.mode === 'resume') args.push('-r', spec.session.sessionId);
-      args.push(spec.prompt);
+      if (spec.session.mode === 'fork') {
+        throw new DispatchRejected('codebuddy: fork 会话未实现(不静默当成新会话跑)');
+      }
+      // stdin delivery is unverified for this CLI, so argv stays, with the "-" / length guards.
+      args.push(argvPrompt('codebuddy', spec.prompt));
       return { command: entry.command, args };
     },
 

@@ -45,22 +45,38 @@ test('settings.json 里的第三方端点:报主机、判为非原生、且不�
   }
 });
 
-test('进程 env 优先于 settings.json,并能判出原生 Anthropic', async () => {
+// 2026-10-16, measured with the real Claude Code 2.1.302 against four local mock servers:
+// settings-file env beats the process environment. The previous version of this test encoded the
+// opposite assumption, which made the egress report (and local-only decisions) name the wrong host.
+test('settings.json 的 env 优先于进程 env(真 CLI 实测)', async () => {
   const { dir, file } = await fixtureSettings({ ANTHROPIC_BASE_URL: 'https://relay.example.com' });
   try {
     const r = await claudeEgress({
       settingsPath: file,
       env: { ANTHROPIC_BASE_URL: 'https://api.anthropic.com' },
       readProxyClues: false,
+      managedPath: join(dir, 'no-managed.json'),
     });
-    assert.equal(r.endpointHost, 'api.anthropic.com');
-    assert.equal(r.nativeAnthropic, true);
-    assert.match(r.source, /进程 env/);
-    assert.match(r.notice, /原生 Anthropic/);
+    assert.equal(r.endpointHost, 'relay.example.com');
+    assert.equal(r.nativeAnthropic, false);
+    assert.match(r.source, /settings\.json/);
     assert.ok(!JSON.stringify(r).includes(SENTINEL));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('只有进程 env 时用它,并能判出原生 Anthropic', async () => {
+  const r = await claudeEgress({
+    settingsPath: join(tmpdir(), 'egress-不存在', 'settings.json'),
+    env: { ANTHROPIC_BASE_URL: 'https://api.anthropic.com' },
+    readProxyClues: false,
+    managedPath: join(tmpdir(), 'egress-不存在', 'managed.json'),
+  });
+  assert.equal(r.endpointHost, 'api.anthropic.com');
+  assert.equal(r.nativeAnthropic, true);
+  assert.match(r.source, /process env/);
+  assert.match(r.notice, /原生 Anthropic/);
 });
 
 test('没配端点 = 按默认原生处理,并说明来源是默认值(不许假装读到了配置)', async () => {

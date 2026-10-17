@@ -19,6 +19,11 @@ WorkBuddy / Qwen / 其它接入的 worker),以及人。
   桥只做 subprocess 派发。
 - 禁止把密钥写进 `config.toml` / `.env` / adapter 源码 / 测试夹具 / 日志。
 - 调试需要看凭证时**只打印是否存在,不打印内容**。
+- **Not forwarding includes the environment** (2026-10-16, `src/env.ts`): workers receive a filtered
+  environment. Each adapter's `credentialEnv` names its own vendor's variables; every other
+  credential-looking variable (e.g. another vendor's API key, a host session token such as
+  `CLAUDE_CODE_MESSAGING_TOKEN`) is withheld, and only its *name* is reported. Widening is explicit
+  (`LLMS_BRIDGE_PASS_ENV`).
 
 #### 1.1 补充条款:本地服务的 token
 
@@ -57,7 +62,10 @@ WorkBuddy / Qwen / 其它接入的 worker),以及人。
 - **已实现**(`src/worktree.ts`):写任务在 git 仓库下自动分配 `--detach` worktree,
   worker 的 cwd 被换成它,**源仓库不动**。
 - **worktree 只保证"默认落点",不保证"不出界"**(绝对路径照样能写出去),所以要配**事后审计**
-  (已实现,`src/audit.ts`):派发前后对**调用方原始 cwd** 各取一次 `git status` 与 HEAD 比对。
+  (已实现,`src/audit.ts`):派发前后对**调用方原始 cwd** 各取一次快照并比对。
+  2026-10-16: the snapshot is `git status --untracked-files=all` + a size/mtime/ctime fingerprint of
+  every dirty/untracked path + HEAD + all refs. Comparing status codes alone missed a rewrite of an
+  already-dirty file and new files inside an untracked directory.
   只读档改了盘、或已隔离的写档动了主仓库 ⇒ 判 `failed` 并说明越界 —— **不许停在 `status=ok`**,
   因为实测确有调用方只看 status。反向也一样:非 git 目录要如实报 `audited:false`,
   那**不等于** `changed:false`,更不等于"没改动"。
@@ -84,13 +92,20 @@ WorkBuddy / Qwen / 其它接入的 worker),以及人。
   - 文件**不存在** = 不限制(不给所有既有仓库加一道默认拒绝);
   - 文件存在 = 白名单:`cloud.allowHarnesses` 非空则 harness 必须在名单里;名单为空则只放行
     **自报端点在本机**的 harness;
-  - **端点未知一律按不可信处理**。全机只有 claude 自报 egress,所以"不自报"在空名单下会被拒 ——
+  - 2026-10-16: **every applicable policy file must allow the dispatch** — the cwd and each ancestor,
+    the main worktree of a linked worktree, and the user-wide `~/.llms-bridge/policy.json` (before,
+    a sub-directory or worktree cwd silently skipped the repository's policy);
+  - **端点未知一律按不可信处理**。claude and codex report egress (others do not); with several
+    candidate hosts, **every** one must be local ——
     把"不知道"当"安全"是本项目最忌的静默降级;
   - 文件坏掉/键名写错 = **拒**(用户建它是为了限制,解析失败不该悄悄解除限制)。
 
 ### 4. 成本:每个任务都要有上限
 
-- `budget.max_tokens` 与 `budget.max_wall_ms` 是任务必填项。
+- `budget.max_wall_ms` is mandatory; `budget.max_tokens` is optional in the API (as the README and code
+  always had it — this file previously said "mandatory"). When given, the ack must say what it can do
+  for that harness: `streaming` = stops the run mid-way, `final` = judged only afterwards, `none` = not
+  enforceable. Counting = cumulative input (cache reads/writes included) + output.
 - 超限时**中断并如实报告**,不允许静默续跑、不允许偷偷换更贵的模型把任务"跑完"。
 - 优先档位顺序:本地 Ollama → 便宜档 → 贵档。要升档必须说明理由。
 
@@ -159,6 +174,10 @@ WorkBuddy / Qwen / 其它接入的 worker),以及人。
 
 ## 六、当前状态
 
+- 2026-10-16 (local hardening on macOS): `npm test` = 197 tests (190 pass / 0 fail / 7 skipped:
+  2 workstation-specific, 1 Windows-only, 3 need real model credit, 1 real CLI against a local mock),
+  independent of which CLIs are installed; `npm run check` (tsc) passes. Fixes and their regression
+  tests are summarised at the top of README. Original 2026-09-19 record below:
 - 仓库建立于 2026-09-19,尚未有实现代码。
 - 设计见 `PLAN.md`(2026-09-19 修订版):**五级集成模型** + **多宿主主脑**
   ——主脑是"你此刻正在用的那个会话",不是某个固定 harness。

@@ -37,6 +37,10 @@ const scheduler = new Scheduler(createAdapters());
 
 const log = (msg: string) => process.stderr.write(`[llms-bridge] ${msg}\n`);
 
+// Last line of defence: a stray rejection must be logged, not terminate the server and every
+// task it is supervising (Node's default for unhandled rejections is to exit).
+process.on('unhandledRejection', (reason) => log(`unhandled rejection (kept running): ${String(reason)}`));
+
 // 启动即预热探测:层级① 的 ACP 握手是秒级的,不预热会让第一次 harness_list/dispatch 卡住。
 // 预热是后台的,不阻塞 stdin 开始服务。
 void scheduler.detectAll().catch((err) => log(`预热探测失败: ${String(err)}`));
@@ -112,6 +116,21 @@ const TOOLS = [
     },
   },
   {
+    name: 'harness_cancel',
+    description:
+      'Cancel a running task: terminates the worker and every process it started (process group / taskkill /T). ' +
+      'The result then has status "cancelled". 取消在跑的任务并结束它的整个进程树。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string' },
+        reason: { type: 'string', description: 'Recorded as the result reason' },
+      },
+      required: ['task_id'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'harness_poll',
     description: '查任务状态:是否结束、状态、已产出多少事件、用量、最后一个事件。不阻塞。',
     inputSchema: {
@@ -125,22 +144,33 @@ const TOOLS = [
     name: 'harness_result',
     description:
       '取任务结果。未跑完则返回 finished=false(不阻塞),此时继续用 harness_poll 轮询。' +
-      '写任务的 result.diff 是 worker 改动的 unified diff —— 交叉评审时直接把它交给另一家当输入。',
+      '写任务的 result.diff 是 worker 改动的 unified diff(相对 base_commit,含 worker 自己的提交;' +
+      '已脱敏并按 max_diff_bytes 截断)。完整未截断的 patch 在 diffPath(本机文件)—— 交叉评审时把文件路径交给另一家,' +
+      '不要把截断的 diff 当全文。The diff is redacted and capped; the full patch is in diffPath.',
     inputSchema: {
       type: 'object',
-      properties: { task_id: { type: 'string' } },
+      properties: {
+        task_id: { type: 'string' },
+        max_diff_bytes: { type: 'integer', description: 'Cap for the diff in this response (default 60000, max 200000)' },
+      },
       required: ['task_id'],
       additionalProperties: false,
     },
   },
   {
     name: 'harness_events',
-    description: '取归一化事件流(status/message/tool_call/tool_result/diff/usage/error/result),用于跟踪过程。',
+    description:
+      '取归一化事件流(status/message/tool_call/tool_result/diff/usage/error/result),分页返回。' +
+      'Paged: returns at most `limit` events and about `max_bytes` of JSON; continue with since_seq = next_seq while has_more is true. ' +
+      'Vendor raw payloads are omitted unless include_raw is true.',
     inputSchema: {
       type: 'object',
       properties: {
         task_id: { type: 'string' },
-        since_seq: { type: 'integer', description: '只取 seq >= 该值的事件,省略则全取' },
+        since_seq: { type: 'integer', description: '只取 seq >= 该值的事件' },
+        limit: { type: 'integer', description: 'Max events (default 50, max 500)' },
+        max_bytes: { type: 'integer', description: 'Approximate response cap in bytes (default 64000, max 1000000)' },
+        include_raw: { type: 'boolean', description: 'Include vendor raw payloads (default false)' },
       },
       required: ['task_id'],
       additionalProperties: false,
@@ -173,6 +203,8 @@ async function callTool(name: string, args: Record<string, unknown>) {
           supportedApprovals: r.supportedApprovals,
           // 与档位同一份输出:只给 supportedApprovals 会让调用方以为列出来的档都拦得住。
           approvalEnforcement: r.approvalEnforcement,
+          // streaming = max_tokens can stop a run; final = only judged afterwards; none = not enforceable.
+          usageReporting: r.usageReporting,
           approvalNotes: Object.fromEntries(
             Object.entries(r.approvalEnforcement).map(([lvl, e]) => [lvl, enforcementNote(lvl as ApprovalLevel, e!)]),
           ),
@@ -221,6 +253,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
         model: spec.model,
         isolated: ack.isolated,
         worktree: ack.worktreePath,
+        base_commit: ack.baseCommit,
         // 派发那一刻就说清这个档位在**这家**拦不拦得住,不等结果。
         approval_enforcement: ack.approvalEnforcement,
         approval_note: ack.approvalNote,
@@ -234,9 +267,24 @@ async function callTool(name: string, args: Record<string, unknown>) {
               prompt_bytes: ack.egress.promptBytes,
               proxy_clues: ack.egress.proxyClues,
               notice: ack.egress.notice,
+              alternate_hosts: ack.egress.alternateHosts,
             }
           : undefined,
-        hint: '用 harness_poll 轮询,harness_result 取结果',
+        policies: ack.policies && ack.policies.length > 0 ? ack.policies : undefined,
+        env_withheld: ack.envWithheld.length > 0 ? ack.envWithheld : undefined,
+        max_tokens_enforcement: ack.maxTokensEnforcement,
+        hint: '用 harness_poll 轮询,harness_result 取结果,harness_cancel 取消',
+      });
+    }
+
+    case 'harness_cancel': {
+      const taskId = requireString(args, 'task_id');
+      const reason = typeof args.reason === 'string' && args.reason.length > 0 ? args.reason : 'cancelled by caller';
+      const wasRunning = scheduler.cancel(taskId, reason);
+      return textResult({
+        task_id: taskId,
+        cancelled: wasRunning,
+        hint: wasRunning ? '已发出终止;用 harness_result 读取最终状态(cancelled)' : '任务已经结束,无需取消',
       });
     }
 
@@ -249,14 +297,39 @@ async function callTool(name: string, args: Record<string, unknown>) {
       if (!snap.finished) {
         return textResult({ task_id: taskId, finished: false, hint: '任务仍在跑,继续用 harness_poll 轮询' });
       }
-      return textResult(await scheduler.collect(taskId));
+      const result = await scheduler.collect(taskId);
+      const cap = Math.max(1_000, Math.min(200_000, typeof args.max_diff_bytes === 'number' ? args.max_diff_bytes : 60_000));
+      const out: Record<string, unknown> = { ...result };
+      if (typeof result.diff === 'string' && result.diff.length > cap) {
+        out.diff = result.diff.slice(0, cap) + '\n...[diff 在本响应中截断;完整 patch 见 diffPath]';
+        out.diffTruncated = true;
+      }
+      const audit = result.diskAudit;
+      if (audit?.paths && audit.paths.length > 200) {
+        out.diskAudit = { ...audit, paths: audit.paths.slice(0, 200), pathsOmitted: audit.paths.length - 200 };
+      }
+      return textResult(out);
     }
 
     case 'harness_events': {
       const taskId = requireString(args, 'task_id');
-      const since = typeof args.since_seq === 'number' ? args.since_seq : undefined;
-      const events = scheduler.events(taskId).filter((e) => since === undefined || e.seq >= since);
-      return textResult({ task_id: taskId, count: events.length, events });
+      const page = scheduler.eventsPage(taskId, {
+        sinceSeq: typeof args.since_seq === 'number' ? args.since_seq : undefined,
+        limit: typeof args.limit === 'number' ? args.limit : undefined,
+        maxBytes: typeof args.max_bytes === 'number' ? args.max_bytes : undefined,
+        includeRaw: args.include_raw === true,
+      });
+      return textResult({
+        task_id: taskId,
+        total: page.total,
+        returned: page.returned,
+        has_more: page.hasMore,
+        next_seq: page.nextSeq,
+        clipped_fields: page.clippedFields || undefined,
+        dropped_from_memory: page.droppedFromMemory,
+        from_journal: page.fromJournal,
+        events: page.events,
+      });
     }
 
     default:
@@ -303,7 +376,24 @@ async function handleMessage(msg: any): Promise<unknown | undefined> {
   }
 }
 
+/**
+ * Shutdown: when the host closes stdin or signals us, stop every worker tree first. Workers run
+ * in their own process groups, so leaving without this would orphan them.
+ */
+let shuttingDown = false;
+async function shutdown(why: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const n = scheduler.cancelAll(`bridge shutting down: ${why}`);
+  if (n > 0) log(`shutting down (${why}); cancelling ${n} running task(s)`);
+  await Promise.race([scheduler.idle().catch(() => {}), new Promise((r) => setTimeout(r, 5_000))]);
+  process.exit(0);
+}
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
+
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on('close', () => void shutdown('stdin closed'));
 rl.on('line', (line) => {
   const trimmed = line.trim();
   if (trimmed.length === 0) return;

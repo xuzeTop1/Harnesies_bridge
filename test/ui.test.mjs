@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -53,7 +53,7 @@ function makeWriter() {
 }
 
 async function makeRepo() {
-  const dir = await mkdtemp(join(tmpdir(), 'llms-bridge-ui-repo-'));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'llms-bridge-ui-repo-')));
   git(dir, ['init', '-q']);
   await writeFile(join(dir, 'seed.txt'), 'seed\n', 'utf8');
   git(dir, ['add', '-A']);
@@ -62,7 +62,7 @@ async function makeRepo() {
 }
 
 async function seededRepo() {
-  const dir = await mkdtemp(join(tmpdir(), 'llms-bridge-ui-'));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'llms-bridge-ui-')));
   const scheduler = new Scheduler([makeAdapter()]);
   const ack = await scheduler.dispatch({
     taskId: crypto.randomUUID(),
@@ -142,7 +142,7 @@ test('跑完一条桩任务后面板能汇总到它,并把用量与档位一起�
 });
 
 test('没自报用量的任务计入 unreported,不算"用了 0 token 的成功任务"', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'llms-bridge-ui-'));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'llms-bridge-ui-')));
   const scheduler = new Scheduler([{
     ...makeAdapter(),
     id: 'quiet',
@@ -199,7 +199,7 @@ test('按工作区归组:桥建的 worktree 单独一栏,未隔离的另起一�
 });
 
 test('会话详情 = 账本正文 + 落盘事件流,两个事件数都给', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'llms-bridge-ui-'));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'llms-bridge-ui-')));
   try {
     const scheduler = new Scheduler([makeAdapter()]);
     await scheduler.dispatch({
