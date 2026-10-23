@@ -11,6 +11,7 @@ import type {
   SpawnPlan,
   TaskSpec,
   Usage,
+  ModelCatalog,
 } from '../types.ts';
 import { DispatchRejected } from '../types.ts';
 import { resolveGlobalCli } from '../locate.ts';
@@ -167,12 +168,65 @@ export function createClaudeAdapter(): Adapter {
       ];
       if (spec.outputSchemaPath) args.push('--json-schema', spec.outputSchemaPath);
       if (spec.model) args.push('--model', spec.model);
+      if (spec.effort) args.push('--effort', spec.effort);
       if (spec.session.mode === 'resume') args.push('--resume', spec.session.sessionId);
       else if (spec.session.mode === 'fork') args.push('--resume', spec.session.sessionId, '--fork-session');
       args.push(spec.prompt);
       return { command: cli.command, args };
     },
 
+    /** `--effort` 的取值就写在 `--help` 里(跨两行),按行拼窗口再取括号。 */
+    async listEfforts(): Promise<ModelCatalog | null> {
+      if (!cli) return null;
+      try {
+        const { stdout } = await execFileAsync(cli.command, [...cli.prefixArgs, '--help'], {
+          timeout: 20_000,
+          windowsHide: true,
+        });
+        const lines = stdout.split(/\r?\n/);
+        const at = lines.findIndex((l) => /--effort/.test(l));
+        if (at < 0) return null;
+        const inside = /\(([^)]*)\)/.exec(lines.slice(at, at + 3).join(' '));
+        if (!inside) return null;
+        const values = inside[1]!.split(',').map((v) => v.trim()).filter(Boolean);
+        if (values.length === 0) return null;
+        return { models: values, source: 'claude --help 的 --effort 说明', checkedAt: Date.now() };
+      } catch {
+        return null;
+      }
+    },
+
     createRun,
+
+    /**
+     * Claude Code 不枚举完整 model id;`--help` 只声明了三个**别名**(fable/opus/sonnet)。
+     * 所以只报它自己写出来的别名,并标明"非完整 id" —— 完整清单仍是未知,
+     * 调用方不该把别名当成可用模型 id 去编造。
+     */
+    async listModels(): Promise<ModelCatalog | null> {
+      if (!cli) return null;
+      try {
+        const { stdout } = await execFileAsync(cli.command, [...cli.prefixArgs, '--help'], {
+          timeout: 20_000,
+          windowsHide: true,
+        });
+        // `--help` 把这句话折成多行("(e.g." 与 'fable' 不在同一行),所以按行定位再拼窗口,
+        // 不能对整段输出做 split —— 那会把中间那段切掉。
+        const lines = stdout.split(/\r?\n/);
+        const at = lines.findIndex((l) => /alias for the latest model/i.test(l));
+        if (at < 0) return null;
+        const inside = /\(e\.g\.\s*([^)]*)\)/i.exec(lines.slice(at, at + 4).join(' '));
+        if (!inside) return null;
+        const models = Array.from(inside[1].matchAll(/'([^']+)'/g)).map((m) => m[1]!).filter(Boolean);
+        if (models.length === 0) return null;
+        return {
+          models,
+          source: 'claude --help 的 --model 说明(这些是别名,不是完整 model id)',
+          checkedAt: Date.now(),
+        };
+      } catch {
+        return null;
+      }
+    },
   };
 }

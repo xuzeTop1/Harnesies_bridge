@@ -854,3 +854,50 @@ db 是 **protobuf 字节数组**(`steps`/`gen_metadata`),扫可读 ASCII 只找�
    (codex / codebuddy / claude)。两路并发评审在 `test/cross-review.test.mjs` 的三家投票用例里
    已实测(`Promise.all` 派发,互不干扰)。**尚未做的**是"同一任务并行派给多家、再比对/合并产出"
    这一层编排 —— 目前只有"一家生产、多家评审"这一种拓扑。
+
+### 8.3 圆桌:多模型轮流讨论(2026-10-23 新增,已实测)
+
+- 入口:`node src/cli.ts roundtable --topic <t> --seats codex:gpt-6-astra,claude --rounds 2`。
+  实现 `src/roundtable.ts`,复用 `Scheduler` 的 dispatch/collect/events,**不另起进程管理层**。
+- 结构:**一个房间 = 一个文件夹**,`<cwd>/.llms-bridge/roundtable/<id>/` 下
+  `room.json` / `transcript.jsonl` / `sessions.json` / `workspace/`(默认空目录)。
+  **每席一条原生会话**,不是每轮全量重放:每轮只喂"本席上轮之后别人的发言"。
+- 全部 `read-only`;`PASS` 视为弃权、不写讨论记录;单家失败记 `absent` 后继续,不卡整轮。
+- 会话失效自动降级:识别到 session/thread 类错误后改用新会话 + 全量重放,转录记 `reseeded: true`。
+  **实测触发过**,不是纸面分支。
+- 上限:单轮墙钟、单轮 token、提示词字符上限(argv 上限 32767 的余量);重放按预算裁剪并如实报省略条数。
+- 实测 2026-10-23(codex:gpt-6-astra + claude,r1 房间):两家 4 次发言均有产出;
+  claude 续接后主动更正自己上一轮的说法,codex 续接后引用自己上轮的排序 —— 原生会话确实连着。
+- **顺带修掉一个既有 bug**:`src/adapters/codex.ts` 的 `plan()` 对 resume 照搬了 fresh 的参数
+  (`-C` / `-s`),而 `codex exec resume` 实测(`codex-cli 0.163.0-alpha.11.1`)不接受这两个旗标
+  (报 `unexpected argument '-C'`)—— 即此前任何 codex resume 都必然失败。
+  改为 `-c sandbox_mode="<mode>"` + 靠子进程 cwd;修后 r1 第 5/6 轮续接正常。
+- 未做:Gemini 席位(见 §3.6 与 §8.1)、用户中途插话。
+- **模型自报(2026-10-23 补)**:`codex` 读 CLI 自己的 `~/.codex/models_cache.json`(本机 9 条,带 `fetched_at`
+  作为 `checkedAt`);`claude` 只报 `--help` 里的**别名** `fable/opus/sonnet`,并在 `source` 里注明"不是完整 model id"。
+  读不到一律返回 `null` → 面板显示"未知",不填默认值。
+- **只读 GUI(2026-10-23 补)**:`node src/cli.ts ui` 后面板多一个 `/rooms` 视图(房间列表 + 逐轮发言),
+  1 秒轮询、纯 `createElement/textContent` 渲染。房间登记在 `~/.llms-bridge/roundtable-rooms.json`,
+  **房间本体仍在用户指定的 cwd**。
+- **面板的写入口(2026-10-23 晚,经用户要求)**:唯一写接口 `POST /api/roundtable/start`,
+  只 spawn 自家的 `cli.ts roundtable` 子进程;其余接口仍只读。同一时刻只允许一场(antigravity 共用"当前会话")。
+  席位目录 `GET /api/seats-catalog` 返回三家的**自报**模型与思考档(claude/codex 有,antigravity 空 → 显"未知")。
+  校验:`topic ≤ 4000`、`seats` 只收 `[\w.:@/,-]`、`rounds 0..10`;`rounds=0` 只登记房间不派发,用于零成本冒烟。
+- ⚠ 改完 adapter 后 `harness_models` 不会立刻变:宿主里的 MCP server 是常驻进程,载着旧代码,
+  需重启宿主/重连才会反映新清单(实测踩到过)。
+- **思考强度(2026-10-23 补)**:席位语法扩成 `harness[:model][@effort]`。  `claude` 走 `--effort`(其 `--help` 声明 low/medium/high/xhigh/max),`codex` 走
+  `-c model_reasoning_effort="..."`(fresh 与 resume 都带)。**不做统一枚举、不静默忽略**:
+  值原样透传,不认的值由那家 CLI 自己报错,结果里记成 `absent`。
+  `TaskSpec.effort` 因此是自由字符串,不是联合类型。
+- 验证用**零成本**方式:单测断言两家 argv 里确实带了该参数,再加一个假调度器的整轮编排用例
+  (验证 effort/model 逐席进 spec、第二轮续接同一席会话)。**没有为这个参数跑真实模型**。
+- **收敛与产出(2026-10-23 补)**:`--until-consensus` 让圆桌跑到**全员弃权**为止(最多 `--rounds` 轮),
+  随后由 `--finalize <seat>` 指定的那一席(默认第一席)执笔,产出 `<room>/final.md`;
+  转录里记一条 `kind:'final'`。GUI 侧是设置抽屉里的「讨论到出结果」(默认勾选)。
+  ⚠ 代价:最多 N 轮 × 席位数 + 1 次收尾,比固定一轮贵。
+- **每席发言落 md**:每个 `message`/`final` 记录写一份 `<room>/md/tNNN-<seat>.md`(含 token 行)。
+- **页面脚本外置**:`src/rooms-page.js` → `/rooms.js`。内联在模板字符串里时,正则的 `\s \n`
+  会被模板转义吃掉。Markdown 用安全子集:**逐节点建 DOM,禁 innerHTML**,链接只放行 http/https/mailto。
+- 已知红灯(**非本次改动引入**):全量 `npm test` 偶发 `git init` 失败于临时目录(并发);
+  `adapters.test.mjs` 里 codebuddy 的 `Currently supported: (...)` 锚点已随 `--help` 排版漂移过期
+  (同一版本下 `harness_models` 仍能列出 17 个模型,说明解析器没坏、是断言过期)。

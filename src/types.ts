@@ -55,6 +55,13 @@ export interface TaskSpec {
    * **换模型 ≠ 跨厂商**,别把同 vendor 的不同模型当成"交叉验证"来宣称。
    */
   model?: string;
+  /**
+   * 思考强度。取值**各家不同**:claude 是 low/medium/high/xhigh/max,
+   * codex 是 `model_reasoning_effort` 的合法值(可在 config 里自行扩展)。
+   * 所以这里不设统一枚举 —— 统一一份交集会把"传了但被忽略"变成静默降级;
+   * 各家 adapter 原样透传,不认的值由那家 CLI 自己报错,结果里看得到。
+   */
+  effort?: string;
   /** 显式开闸才会把 approval='full' 放行。 */
   allowedFull?: boolean;
   /**
@@ -238,6 +245,12 @@ export interface Adapter {
    * 面板一旦有了假条目,用户就会照着它去派发,然后拿到一个不存在的模型。
    */
   listModels?(): Promise<ModelCatalog | null>;
+  /**
+   * 该 harness 能否**自己声明**接受的思考强度取值。返回 null = 不自报,
+   * 调用方必须显示"未知",不许拿别家的清单顶上(同 listModels 的理由)。
+   * 复用 ModelCatalog 的形状:`models` 字段装的是 effort 取值。
+   */
+  listEfforts?(): Promise<ModelCatalog | null>;
   /**
    * 自报"这次派发的数据会发往哪个主机"。不实现 = 桥不知道,调用方**不许**替它编一个。
    * 用途见 src/egress.ts:同一个 harness id 可能对应原生端点或第三方中转,两者数据去向

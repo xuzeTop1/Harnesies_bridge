@@ -4,6 +4,7 @@ import { createClaudeAdapter } from './adapters/claude.ts';
 import { createCodeBuddyAdapter } from './adapters/codebuddy.ts';
 import { createOpencodeAdapter } from './adapters/opencode.ts';
 import { createAcpAdapter } from './adapters/acp.ts';
+import { createAntigravityAdapter } from './adapters/antigravity.ts';
 
 /**
  * 适配器注册表。
@@ -44,5 +45,8 @@ export function createAdapters(): Adapter[] {
     createOpencodeAdapter(),
     createClaudeAdapter(),
     createCodexAdapter(),
+    // 层级④:Gemini 的 CLI 客户端已被退役(见 PLAN §3.6),改驱动本机运行的 Antigravity。
+    // 它操作"当前会话"而非独立进程,且 read-only 只是标签 —— 派发前务必看 adapter 头注释。
+    createAntigravityAdapter(),
   ];
 }

@@ -55,6 +55,15 @@ const USAGE = `llms-bridge(冒烟入口)
       并写进 ~/.llms-bridge/ui.json 供事后找回。Ctrl-C 退出。
       它没有任何派发/取消接口 —— 控制面仍然只有 MCP 那六个原语。
 
+  node src/cli.ts roundtable --topic <text> --seats <harness[:model][@effort],...>
+      [--rounds <n>] [--until-consensus] [--finalize <seat>] [--id <room>] [--cwd <dir>]
+      [--keep <n>] [--max-chars <n>] [--max-turn-ms <n>] [--max-tokens-per-turn <n>] [--board <file>]
+      多模型圆桌:一个房间=一个文件夹,每席一条原生会话,每轮只喂"别人刚说的话"。
+      房间落在 <cwd>/.llms-bridge/roundtable/<id>/(转录 transcript.jsonl + 会话 sessions.json +
+      每席发言 md/ + 收尾 final.md)。
+      加 --until-consensus:跑到全员无异议(最多 rounds 轮),再由 --finalize 指定的那一席
+      产出一份 final.md;全部按 read-only 派发,工作目录默认是房间自己的空目录。
+
   approval 取值: read-only | workspace-write | full(full 需 --allow-full)`;
 
 async function main(): Promise<number> {
@@ -112,6 +121,7 @@ async function main(): Promise<number> {
     const { startUi } = await import('./ui.ts');
     const handle = await startUi({ port: num(flags, 'port') ?? 0 });
     console.log(`[ui] 只读面板已起在 ${handle.url}`);
+    console.log(`[ui] 圆桌视图: ${handle.url}rooms`);
     console.log(`[ui] 端口是临时分配的,登记在 ${handle.registryPath}`);
     console.log('[ui] Ctrl-C 退出。面板不派发任务,只读账本。');
     // 挂住不退:等信号。SIGINT 走默认行为即可,这里只需别让事件循环提前空掉。
@@ -185,6 +195,55 @@ async function main(): Promise<number> {
       }
       throw err;
     }
+  }
+
+  if (command === 'roundtable') {
+    const { runRoom, parseSeats } = await import('./roundtable.ts');
+    const topic = str(flags, 'topic');
+    const seatsRaw = str(flags, 'seats');
+    if (!topic || !seatsRaw) {
+      console.error('roundtable 需要 --topic 与 --seats');
+      console.error('例:node src/cli.ts roundtable --topic "..." --seats codex:gpt-6-astra,claude --rounds 2');
+      return 2;
+    }
+    const rounds = num(flags, 'rounds') ?? 2;
+    const maxTokensPerTurn = num(flags, 'max-tokens-per-turn');
+    const board = str(flags, 'board');
+    const finalizeSeat = str(flags, 'finalize');
+    const untilConsensus = flags.get('until-consensus') === true;
+    const id = str(flags, 'id') ?? `room-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+
+    const result = await runRoom(
+      scheduler,
+      {
+        id,
+        topic,
+        seats: parseSeats(seatsRaw),
+        rounds,
+        cwd: resolve(str(flags, 'cwd') ?? process.cwd()),
+        maxWallMsPerTurn: num(flags, 'max-turn-ms') ?? 180_000,
+        keepTurns: num(flags, 'keep') ?? 8,
+        maxPromptChars: num(flags, 'max-chars') ?? 24_000,
+        ...(maxTokensPerTurn === undefined ? {} : { maxTokensPerTurn }),
+        ...(board === undefined ? {} : { boardPath: board }),
+        ...(untilConsensus ? { untilConsensus } : {}),
+        ...(finalizeSeat === undefined ? {} : { finalizeSeat }),
+      },
+      {
+        onStatus: (message) => console.error(message),
+        onTurn: (t) => {
+          const kind = t.kind === 'message' ? '' : ` [${t.kind}${t.reason ? `: ${t.reason}` : ''}]`;
+          console.log(`\n[${t.turn}] ${t.seat}${kind}${t.reseeded ? ' [重建会话]' : ''}`);
+          if (t.text) console.log(t.text);
+          if (t.usage) {
+            console.error(`    tokens in=${t.usage.inputTokens ?? '?'} out=${t.usage.outputTokens ?? '?'}`);
+          }
+        },
+      },
+    );
+
+    console.log(`\n房间目录: ${result.dir}`);
+    return 0;
   }
 
   console.error(`未知子命令: ${command}`);

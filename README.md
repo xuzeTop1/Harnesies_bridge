@@ -151,8 +151,11 @@ worktree 的形态由调用方显式选(默认永远是"新建 + 隔离"):
 ## 三层集成,一套事件模型
 
 层级① ACP(ndjson JSON-RPC over stdio,可多轮)、② Claude 兼容 stream-json(双向流)、
-③ 一次性子进程。层级④(宿主本地 API/CDP)与⑤(computer-use)在 PLAN.md 里标为未公开接口,
-**桥目前不实现**。
+③ 一次性子进程。层级④(宿主本地 API/CDP)目前**只对 Antigravity 打通**:Gemini 的 CLI 客户端
+已被 Google 退役,而同一账号在 Antigravity 里正常,所以走它默认开着的 CDP 口驱动界面
+(`src/antigravity-cdp.ts` + `src/adapters/antigravity.ts`)。这层是**未公开接口**,按 best-effort
+对待:端口每次启动都变(读 `DevToolsActivePort`,不硬编码)、失败显式报错、不假装成功。
+⑤(computer-use)仍不实现。
 
 差异只允许藏在 adapter 里,对外统一成:
 `status` / `message` / `tool_call` / `tool_result` / `diff` / `usage` / `error` / `result`。
@@ -195,25 +198,54 @@ Anthropic 端点、端点是从哪一层读到的、以及本机代理线索。
 - adapter 没实现 `egress()` 的就是**缺字段**,不替它编一份;
 - 这一报告是**知情用**,不是判定 —— 请求到底走不走某个代理,桥无法验证,判断留给你。
 
-## 给人看的面板（只读）
+## 圆桌:多模型轮流讨论(2026-10-23 新增)
+
+除了"派一个子任务",桥还能把几家拉到同一张桌子上轮流发言:
+
+```bash
+node src/cli.ts roundtable \
+  --topic "这个方案可行吗?" \
+  --seats codex:gpt-6-astra@low,claude@max,antigravity \
+  --rounds 3 --until-consensus
+```
+
+- **一个房间 = 一个文件夹**:`<cwd>/.llms-bridge/roundtable/<id>/`
+  `room.json` / `transcript.jsonl` / `sessions.json` / `workspace/` / `md/` / `final.md`。
+- **每席一条原生会话**(不是每轮全量重放):每轮只喂"本席上轮之后别人的发言"。会话失效自动降级为
+  "新开会话 + 全量重放",转录里标 `reseeded`。
+- **全部 read-only 派发**;`PASS` = 弃权、不写讨论记录;单家失败记 `absent` 后继续,不卡整轮。
+- **收敛**:`--until-consensus` 跑到**全员弃权**为止(最多 `--rounds` 轮);随后由 `--finalize`
+  指定的一席(默认第一席)执笔,产出 `<room>/final.md`,转录记一条 `kind:'final'`。
+  代价是"最多 N 轮 × 席位数 + 1 次收尾",比固定一轮贵。
+- **每席发言落 md**:`<room>/md/tNNN-<seat>.md`。
+- **附件两段式**:`[附件] <path>` 指向的文件会被**读成正文内联进提示词**(不依赖各家的沙箱读权限);
+  附件首次出现的那一轮给全文(单文件 ≤12k 字符、合计 ≤20k),之后只喂**要点稿**
+  (按标题抽取,≤2k),直到上传新附件。`uploads/` 在房间自己的工作区里。
+
+## 给人看的面板
 
 ```
-node src/cli.ts ui          # 打印实际 URL,并登记在 ~/.llms-bridge/ui.json
+node src/cli.ts ui [--port 8765]   # 打印实际 URL;不带 --port 时端口由系统分配并登记在 ~/.llms-bridge/ui.json
 ```
 
-显示四件事:**当前进度**(在跑 / 在等输出 / 疑似失联 / 已结束 + 事件数 + 最后输出多久前)、
-**分发情况**(按工作区分组:一个 worktree 一栏,里面是它的各轮往来 —— harness、模型、档位、是否隔离、结果或原因)、
-**会话过程**(点任务号读那一轮的 prompt、逐条事件 `tool_call` / `tool_result` / `diff` 与结果原文)、
-**各家 LLM 用量**(任务数、成败、token 合计、未自报用量的条数、用过哪些模型)。
+`/` 是任务观测面板:当前进度(在跑 / 在等输出 / 疑似失联 / 已结束)、按工作区分组的分发情况、
+点任务号看逐条事件与结果、各家 token 用量。
 
-三条边界，都是刻意的：
+`/rooms` 是**圆桌聊天页**:左侧房间、中间消息流(Markdown 渲染、头像/时间/token、弃权与缺席标记)、
+底部输入(Enter 发送 / Shift+Enter 换行,支持拖拽与粘贴附件)、进度条与"停止"、顶栏导出 `.md`。
+席位在设置抽屉里选:**模型与思考档来自各家的自报清单**(codex 读它自己的 `models_cache.json`,
+claude 取 `--help` 的别名与档位,opencode 有几百个模型因此带筛选框);拉不到就显"未知",不替你猜。
 
-- **只读**。没有派发/取消/合并接口 —— 控制面仍然只有 MCP 那六个原语。
-  面板能改状态的那一刻,它就成了第二个主脑,而它比主脑更没有上下文。
-- **只听 `127.0.0.1`,端口由系统分配**(AGENTS.md 禁硬编码端口)。传 `--host 0.0.0.0` 会被直接拒绝:
-  账本里躺着各家任务的 prompt 与模型原文。
-- **数据只来自落盘账本 + 心跳 + 事件流文件**,所以面板和桥谁先起、桥重启几次都不影响它看到历史。
-  面板是**另一个进程**,读不到桥的内存 —— 事件流不落盘之前,"正在跑的会话"根本无从显示。
+边界,都是刻意的:
+
+- **只有一个写入口族**:`POST /api/roundtable/start`、`/api/room/say`、`/api/upload`、`/api/run/stop`。
+  它们只 spawn 自家的 `cli.ts roundtable` 子进程,不代跑模型、不改审批档位;其余接口全部只读。
+  同一时刻**只允许一场**(antigravity 那席共用应用里的"当前会话",并行会互相覆盖)。
+- **只听 `127.0.0.1`**(AGENTS.md 禁硬编码端口;传 `--host 0.0.0.0` 会被直接拒绝:
+  账本里躺着各家任务的 prompt 与模型原文)。
+- **渲染不拼 HTML**:模型输出进 Markdown 渲染器时**逐节点建 DOM**,不用 `innerHTML`;
+  链接只放行 `http/https/mailto`。这条有防回归用例(`.innerHTML =` 出现即判红)。
+- **数据只来自落盘账本 + 心跳 + 事件流**,面板和桥谁先起、桥重启几次都不影响看到历史。
 
 进度为什么可信:`status:'running'` 单独看**毫无信息量**(进程被杀时它就永远停在 running)。
 所以桥每 3 秒写一个几百字节的心跳(`.llms-bridge/tasks/<id>.beat.json`),面板据此区分
@@ -238,8 +270,12 @@ src/
   proc.ts         子进程与 stdout 逐行喂给 parser;超时杀进程树
   registry.ts     注册哪些 adapter
   mcp-server.ts   stdio JSON-RPC:六个原语与参数校验
-  cli.ts          detect / dispatch 的命令行入口
-  adapters/       一家的协议差异都在这层(acp / claude / codex / codebuddy / opencode)
+  cli.ts          detect / dispatch / roundtable / ui 的命令行入口
+  roundtable.ts   圆桌:房间=文件夹、每席原生会话、PASS 与收敛、附件内联+要点稿、final.md
+  rooms-page.js   圆桌聊天页的前端脚本(外链 /rooms.js;逐节点建 DOM,不用 innerHTML)
+  antigravity-cdp.ts  Antigravity 的 CDP 小客户端(端口从 DevToolsActivePort 读)
+  antigravity-run.ts  把一句话送进 Antigravity、按 JSONL 吐回答的子进程
+  adapters/       一家的协议差异都在这层(acp / claude / codex / codebuddy / opencode / antigravity)
 test/             node --test,*.mjs;涉及真派发的由 LLMS_BRIDGE_LIVE=1 才开
 ```
 
