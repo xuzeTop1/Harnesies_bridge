@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 
 export interface RunOptions {
   command: string;
@@ -20,6 +21,28 @@ export interface RunOutcome {
   timedOut: boolean;
   aborted: boolean;
   stderrTail: string;
+}
+
+/**
+ * 连子进程树一起杀。
+ *
+ * Windows 上 `child.kill()` 只终止直接子进程,而这些 CLI 都会再 re-exec 一层
+ * node/语言服务器:杀壳留下的是几百 MB 的主进程,它的 ParentProcessId 指向已死的 PID,
+ * 从此没人能按父进程找到它(2026-10-30 实测:一次全量探测留下 15 个这样的孤儿常驻)。
+ * 所以任何"我起过外部 CLI 进程"的地方都要走这里,不要各自再写一遍。
+ */
+export function killTree(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid === undefined) return;
+  if (process.platform === 'win32') {
+    spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+  } else {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* 已退出 */
+    }
+  }
 }
 
 /**
@@ -52,18 +75,9 @@ export async function runStreaming(o: RunOptions): Promise<RunOutcome> {
     let aborted = false;
     let settled = false;
 
-    const killTree = () => {
-      if (child.pid === undefined) return;
-      if (process.platform === 'win32') {
-        spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
-      } else {
-        child.kill('SIGKILL');
-      }
-    };
-
     const timer = setTimeout(() => {
       timedOut = true;
-      killTree();
+      killTree(child);
     }, o.maxWallMs);
 
     const finish = (exitCode: number | null) => {
@@ -85,7 +99,7 @@ export async function runStreaming(o: RunOptions): Promise<RunOutcome> {
       }
       if (o.shouldAbort?.() === true && !aborted) {
         aborted = true;
-        killTree();
+        killTree(child);
       }
     });
 

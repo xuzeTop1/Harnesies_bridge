@@ -163,6 +163,18 @@ worktree 的形态由调用方显式选(默认永远是"新建 + 隔离"):
 每个 adapter 必须实现 `detect()`。探测不通就**显式标记该 harness 不可用**,不许静默降级到别家。
 ACP 的探测超时算"未判定"而不是"不可用"——会重试一次更宽的时间窗。
 
+层级① 的探测是**真起 CLI 走完 initialize + session/new**(不通的那家要等 8s + 25s 两轮),而宿主
+**每开一个会话就新建一个桥进程**(2026-10-30 实测:ChatGPT 桌面版 25 秒内 16 个 `mcp-server`)。
+所以握手结果跨进程共享在 `<LLMS_BRIDGE_HOME>/acp-probes/`:正结果 15 分钟、"未判定"只 60 秒
+(它得留活路——重跑 `harness_list` 必须还能翻身),同一家全机只有一个进程真在探、其余等它的结果
+(锁主被强杀留下的僵死锁 120s 后可抢)。三点约束:
+
+- 取自缓存时 `harness_list` 的 `note` 会写"本条取自本机共享探测缓存(Ns 前的握手结果)"——
+  缓存过 3 分钟的可用性不许冒充"刚刚确认它活着";要现场重探就 `harness_models` 传 `force: true`。
+- 缓存的是**这一家的握手结果**,不是整份报告:审批档位是静态的,而出口(`egress`)仍每次现算。
+- 探测收尾连**进程树**一起杀(`killTree`,Windows 走 `taskkill /T /F`):这些 CLI 会再 re-exec 一层
+  几百 MB 的主进程,只杀外壳会让它变成 `ParentProcessId` 指向僵尸的孤儿常驻。
+
 ## 四道闸门
 
 1. **凭证**:桥不读、不存、不转发任何云端厂商密钥,无例外。只复用各家 CLI 自己的登录态。
@@ -267,7 +279,8 @@ src/
   policy.ts       仓库级云策略(数据能不能出本机)
   egress.ts       数据去向自报(端点主机、是否原生、代理线索)
   locate.ts       找到各家真二进制(Windows 的 shim 不能直接 spawn)
-  proc.ts         子进程与 stdout 逐行喂给 parser;超时杀进程树
+  probe-cache.ts  ACP 握手结果的跨进程缓存 + 探测互斥锁(宿主每个会话起一个桥进程)
+  proc.ts         子进程与 stdout 逐行喂给 parser;超时杀进程树(killTree 共用)
   registry.ts     注册哪些 adapter
   mcp-server.ts   stdio JSON-RPC:六个原语与参数校验
   cli.ts          detect / dispatch / roundtable / ui 的命令行入口
@@ -283,6 +296,9 @@ test/             node --test,*.mjs;涉及真派发的由 LLMS_BRIDGE_LIVE=1 才
 
 - **Windows**:npm 的 `.cmd` shim 不能直接 spawn(EINVAL),所以 `locate.ts` 从包的 `package.json`
   里解析真 bin;GUI 宿主的子进程不继承 PATH/`LOCALAPPDATA`,路径要能从常见安装位兜底。
+- **一个会话 = 一个桥进程**:宿主(Codex/ChatGPT 桌面版实测)每开一个 thread 就重跑一次 MCP 初始化,
+  所以只活在进程内存里的东西(探测缓存、任务表、心跳)在多实例之间互不知情;要共享就得写到
+  `LLMS_BRIDGE_HOME` 下 —— 账本索引与 `acp-probes/` 都在那儿。
 - **不硬编码端口**:宿主自己的本地端口是启动时分配的临时值,必须从宿主自己的登记文件读。
 - 桥**不是** provider 切换器,也**不是** MCP 路由器 —— 那是 `cc-switch` 与 `mcporter` 的活,
   本仓库复用它们,不重造。

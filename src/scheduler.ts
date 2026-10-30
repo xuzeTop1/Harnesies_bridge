@@ -170,20 +170,23 @@ export class Scheduler {
    * 层级① 的探测要跑一次真实 ACP 握手(initialize + session/new),是秒级的;
    * 若不缓存,每次 harness_dispatch/harness_list 都会再等一轮,直接破坏
    * "dispatch 立刻返回 task_id" 的设计。要刷新就传 force=true。
+   *
+   * 这份缓存只在**本进程**内有效。跨进程那一层在 `probe-cache.ts`:宿主每开一个会话就
+   * 新建一个桥进程,只靠这里的话每个实例都会把层级① 那几家重新握手一遍。
    */
   detectAll(force = false): Promise<HarnessReport[]> {
     if (force || this.#detectPromise === null) {
-      this.#detectPromise = this.#runDetect();
+      this.#detectPromise = this.#runDetect(force);
     }
     return this.#detectPromise;
   }
 
-  async #runDetect(): Promise<HarnessReport[]> {
+  async #runDetect(force: boolean): Promise<HarnessReport[]> {
     // 并行探测:层级① 各家都要跑一次 ACP 握手(且不通的会等到超时),
     // 串行会把这些等待叠加起来。
     return Promise.all(
       [...this.#adapters.values()].map(async (a) => {
-        const d = await a.detect();
+        const d = await a.detect(force);
         return {
           id: a.id,
           tier: a.tier,

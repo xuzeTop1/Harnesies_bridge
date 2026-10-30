@@ -39,6 +39,8 @@ const log = (msg: string) => process.stderr.write(`[llms-bridge] ${msg}\n`);
 
 // 启动即预热探测:层级① 的 ACP 握手是秒级的,不预热会让第一次 harness_list/dispatch 卡住。
 // 预热是后台的,不阻塞 stdin 开始服务。
+// 它之所以敢在每个实例都跑一次:握手结果走 probe-cache.ts 的**跨进程**缓存 —— 宿主每开一个
+// 会话就新建一个本进程,缓存命中时这里一个 CLI 进程都不起;冷缓存时同一家也只有一个人拿到锁在探。
 void scheduler.detectAll().catch((err) => log(`预热探测失败: ${String(err)}`));
 
 const TOOLS = [

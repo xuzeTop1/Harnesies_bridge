@@ -15,6 +15,9 @@ import type {
 import { DispatchRejected } from '../types.ts';
 import { resolveGlobalCli } from '../locate.ts';
 import type { ResolvedCli } from '../locate.ts';
+import { killTree } from '../proc.ts';
+import { probeKey, probeShared } from '../probe-cache.ts';
+import type { ProbeOutcome } from '../probe-cache.ts';
 
 /**
  * 通用 ACP(Agent Client Protocol)适配器 —— 层级①。
@@ -71,7 +74,8 @@ const ACP_SESSION_SELECTION_WIRED = false;
  */
 const ACP_WRITE_APPROVALS_WIRED = false;
 
-interface AcpInitResult {
+/** 一次 initialize + session/new 握手的产物;导出给 probe-cache 的缓存条目类型用。 */
+export interface AcpInitResult {
   agentName?: string;
   agentVersion?: string;
   protocolVersion?: number;
@@ -160,10 +164,14 @@ function acpProbe(cli: ResolvedCli, acpArgs: string[], timeoutMs: number): Promi
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      // 连进程树一起杀:probe 只跑几秒的 initialize + session/new,但这些 CLI 会自己
+      // 再 re-exec 一层 node(100–400 MB)。child.kill() 在 Windows 上只终止外壳,
+      // 主进程会变成孤儿一直常驻 —— 一次全量预热留下过 15 个这样的进程。
+      killTree(child);
       try {
-        child.kill();
+        child.stdin?.destroy();
       } catch {
-        /* 已退出 */
+        /* 已关闭 */
       }
       resolve(result.protocolVersion === undefined ? null : result);
     };
@@ -214,6 +222,43 @@ function acpProbe(cli: ResolvedCli, acpArgs: string[], timeoutMs: number): Promi
       params: { protocolVersion: ACP_PROTOCOL_VERSION, clientCapabilities: {} },
     });
   });
+}
+
+/**
+ * 一次 ACP 探测 = initialize + session/new;**两轮**都试完才算数。
+ *
+ * 为什么 8s 超时不能直接判"不可用":冷启动时 7 个探测并发,qwen/mimo 这类大 Node CLI 的
+ * initialize 常常要更久。实测 Qoder 启动瞬间三家 ACP 全报"握手无响应",而另起进程三家正常
+ * —— 那意味着 `harness_list` 的答案取决于"你什么时候问",而它是大脑唯一的依据。
+ * 所以超时只算**未判定**:再给一次更宽的机会,两次都失败才降级,且措辞必须说清是未判定。
+ *
+ * 结果走 probeShared 缓存。不缓存的代价是真实的:宿主每开一个会话就新建一个桥进程
+ * (实测 ChatGPT 桌面版 25 秒内 16 个),每个都独立把这三家各握手最多两遍。
+ */
+function probeACP(
+  config: AcpAdapterConfig,
+  cli: ResolvedCli,
+  acpArgs: string[],
+  force: boolean,
+): Promise<ProbeOutcome> {
+  const key = probeKey(config.id, cli.command, [...cli.prefixArgs, ...acpArgs]);
+  return probeShared(
+    key,
+    async () => {
+      let probe = await acpProbe(cli, acpArgs, 8_000);
+      if (!probe) probe = await acpProbe(cli, acpArgs, 25_000);
+      return probe;
+    },
+    force,
+  );
+}
+
+/** 取自缓存时要在 detail 里说出来(AGENTS.md 证据纪律)。 */
+function withCacheNote(base: string | undefined, outcome: ProbeOutcome): string | undefined {
+  if (!outcome.fromCache) return base;
+  const age = Math.max(0, Math.round((Date.now() - outcome.checkedAt) / 1000));
+  const note = `本条取自本机共享探测缓存(${age}s 前的握手结果),本次未重新起进程`;
+  return base ? `${base} —— ${note}` : note;
 }
 
 function createRun(spec: TaskSpec, taskId: string, harness: string): RunParser {
@@ -556,6 +601,8 @@ export interface AcpAdapterConfig {
 export function createAcpAdapter(config: AcpAdapterConfig): Adapter {
   const acpArgs = config.acpArgs ?? ['--acp'];
   let cli: ResolvedCli | null = null;
+  /** detect() 那次握手的完整结果;清单就摊在它的 sessionResult 里,别为清单再探一次。 */
+  let lastProbe: ProbeOutcome | null = null;
 
   return {
     id: config.id,
@@ -566,31 +613,34 @@ export function createAcpAdapter(config: AcpAdapterConfig): Adapter {
       ? ['read-only', 'workspace-write', 'full']
       : ['read-only'],
 
-    async detect(): Promise<DetectResult> {
+    async detect(force = false): Promise<DetectResult> {
       cli = await resolveGlobalCli(config.binName, config.pkgName);
       if (!cli) {
         return { available: false, detail: `找不到 ${config.binName}(${config.pkgName})的 bin` };
       }
-      // 单次 8s 超时就判"不可用"是错的:冷启动时 7 个探测并发,qwen/mimo 这类大 Node CLI 的
-      // initialize 常常要更久。实测 Qoder 启动瞬间三家 ACP 全报"握手无响应",而另起进程三家正常
-      // —— 那意味着 `harness_list` 的答案取决于"你什么时候问",而它是大脑唯一的依据。
-      // 所以超时只算"未判定":再给一次更宽的机会,两次都失败才降级,且措辞必须说清这是未判定。
-      let probe = await acpProbe(cli, acpArgs, 8_000);
-      if (!probe) probe = await acpProbe(cli, acpArgs, 25_000);
-      if (!probe) {
+      // 换一家 CLI(或 force 重探)之后的清单必须来自新的一次握手,不能拿上一家的残留顶上。
+      lastProbe = null;
+      const outcome = await probeACP(config, cli, acpArgs, force);
+      lastProbe = outcome;
+
+      if (!outcome.probe) {
         return {
           available: false,
-          detail:
+          detail: withCacheNote(
             'ACP 两次探测均无响应(8s + 25s)—— 这是**未判定**,不是"已确认不可用";重跑 harness_list 可再试',
+            outcome,
+          ),
         };
       }
+      const probe = outcome.probe;
       const version = probe.agentVersion
         ? `${probe.agentName ?? config.id} ${probe.agentVersion} (ACP v${probe.protocolVersion})`
         : undefined;
       if (probe.sessionError) {
-        return { available: true, version, detail: `ACP 通但未鉴权: ${probe.sessionError}` };
+        return { available: true, version, detail: withCacheNote(`ACP 通但未鉴权: ${probe.sessionError}`, outcome) };
       }
-      return { available: true, version };
+      const detail = withCacheNote(undefined, outcome);
+      return { available: true, version, ...(detail ? { detail } : {}) };
     },
 
     plan(spec: TaskSpec): SpawnPlan {
@@ -605,15 +655,17 @@ export function createAcpAdapter(config: AcpAdapterConfig): Adapter {
     /**
      * 清单来自 ACP 自己的 `session/new` 返回,**不是我们整理的**。
      *
-     * 取一次要真起一个进程走完握手(冷启动可能十几秒),所以这里不自己缓存 ——
-     * 调度器已经按进程缓存了(`scheduler.ts` 的 modelCache),再叠一层只会让
-     * "什么时候取的"更难说清。解析不出形状就返回 null,调用方渲染成"未知"。
+     * 它本来就摊在 detect() 那次握手里,所以这里优先复用 lastProbe:此前 `harness_models`
+     * 会为一份清单**再**起一次 25s 握手,而那次探的东西与 detect 完全相同。只有本进程没探过
+     * 才走 probeACP —— 与 detect 共用同一份跨进程缓存,所以不会绕过缓存重复起进程。
+     * 解析不出形状就返回 null,调用方渲染成"未知"。
      */
     async listModels(): Promise<ModelCatalog | null> {
       if (!cli) return null; // 未探测;调度器保证先跑过 detectAll()
-      const probe = await acpProbe(cli, acpArgs, 25_000);
-      if (!probe || probe.sessionResult === undefined) return null;
-      return modelCatalogFromSessionResult(probe.sessionResult, Date.now());
+      const outcome = lastProbe ?? (await probeACP(config, cli, acpArgs, false));
+      if (!outcome.probe || outcome.probe.sessionResult === undefined) return null;
+      // checkedAt 用**握手那一刻**:把缓存过几分钟的清单说成"刚刚核查过"就是编证据。
+      return modelCatalogFromSessionResult(outcome.probe.sessionResult, outcome.checkedAt);
     },
 
     createRun: (spec, taskId) => createRun(spec, taskId, config.id),

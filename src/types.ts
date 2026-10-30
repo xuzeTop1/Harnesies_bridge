@@ -234,7 +234,11 @@ export interface Adapter {
    * 摘掉它就直接不可用了;如实标 advisory 才能让调用方**带着这个认知**去派。
    */
   approvalEnforcement?: Partial<Record<ApprovalLevel, 'enforced' | 'advisory'>>;
-  detect(): Promise<DetectResult>;
+  /**
+   * `force = true` 表示"忽略本机共享的探测缓存,真的重新握手一次"(`harness_models` 的 force
+   * 一路传到这里)。没有缓存可省的适配器忽略这个参数即可 —— 它们本来就是现场取。
+   */
+  detect(force?: boolean): Promise<DetectResult>;
   plan(spec: TaskSpec): SpawnPlan;
   createRun(spec: TaskSpec, taskId: string): RunParser;
   /**
